@@ -35,6 +35,27 @@ Main() {
 		focal)
 			# your code here
 			;;
+		noble)
+			# ====================== 新增这里 ======================
+			# 1. 核心：删除首次开机标记，彻底禁用所有向导
+			rm /root/.not_logged_in_yet
+
+			# 2. 预置root密码（按需修改，跳过改密码弹窗）
+			echo "root:123" | chpasswd
+
+			# 3. 预置上海时区，跳过时区选择
+			# ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+			# echo "Asia/Shanghai" > /etc/timezone
+
+			# 4. 预置中文UTF-8 locale，跳过语言选择
+			# sed -i 's/# zh_CN.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/' /etc/locale.gen
+			# locale-gen zh_CN.UTF-8
+			# echo "LANG=zh_CN.UTF-8" > /etc/default/locale
+
+			# 5. 禁用首次运行systemd服务（双重保险）
+			# systemctl disable --now armbian-firstrun-config 2>/dev/null
+			# ======================================================
+			;;
 	esac
 } # Main
 
