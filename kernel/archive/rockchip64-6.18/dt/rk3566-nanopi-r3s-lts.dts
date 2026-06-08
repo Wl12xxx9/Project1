@@ -7,7 +7,7 @@
 
 /dts-v1/;
 
-#include "rk3566-nanopi-r3s.dts"
+#include "rk3566-nanopi-r3s-custom.dts"
 
 / {
 	compatible = "friendlyarm,nanopi-r3s-lts", "rockchip,rk3566";

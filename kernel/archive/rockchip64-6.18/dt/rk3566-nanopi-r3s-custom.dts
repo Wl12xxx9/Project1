@@ -6,6 +6,8 @@
  * (http://www.friendlyelec.com)
  *
  * Copyright (c) 2024 Tianling Shen <cnsztl@gmail.com>
+ *
+ * version: rk3566-nanopi-r3s-custom-v2.dts
  */
 
 /dts-v1/;
@@ -24,6 +26,7 @@
 		ethernet0 = &gmac1;
 		mmc0 = &sdhci;
 		mmc1 = &sdmmc0;
+		mmc2 = &sdmmc1;
 	};
 
 	chosen: chosen {
@@ -92,10 +95,6 @@
 
 	vcc5v0_usb: regulator-vcc5v0_usb {
 		compatible = "regulator-fixed";
-		enable-active-high;
-		gpio = <&gpio0 RK_PA6 GPIO_ACTIVE_HIGH>;
-		pinctrl-names = "default";
-		pinctrl-0 = <&vcc5v0_usb_host_en>;
 		regulator-name = "vcc5v0_usb";
 		regulator-always-on;
 		regulator-boot-on;
@@ -111,6 +110,29 @@
 		regulator-boot-on;
 		regulator-min-microvolt = <5000000>;
 		regulator-max-microvolt = <5000000>;
+	};
+
+	vdd_wifi: wifi_regulator {
+		compatible = "regulator-fixed";
+		regulator-name = "vdd_wifi_3v3";
+		gpio-enable = <&gpio2 RK_PB1 GPIO_ACTIVE_HIGH>;
+		/* 电压和VCCIO_WL一致 3.3V */
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		/* 上电延时，满足RTL8723上电时序 */
+		startup-delay-us = <100000>;
+	};
+	
+	/* -------------------------- RTL8723 WiFi电源时序 -------------------------- */
+	sdio_pwrseq: sdio-pwrseq {
+		compatible = "mmc-pwrseq-simple";
+		clocks = <&rk809 1>;
+		clock-names = "ext_clock";
+		pinctrl-names = "default";
+		pinctrl-0 = <&wifi_enable_h>;
+		post-power-on-delay-ms = <300>;
+		power-off-delay-us = <3000000>;
+		reset-gpios = <&gpio2 RK_PB1 GPIO_ACTIVE_LOW>;
 	};
 };
 
@@ -160,7 +182,7 @@
 	rx_delay = <0x2f>;
 
 	phy-handle = <&rgmii_phy1>;
-	status = "okay";
+	status = "disabled";
 };
 
 &gpu {
@@ -310,7 +332,8 @@
 				regulator-name = "vccio_acodec";
 				regulator-min-microvolt = <3300000>;
 				regulator-max-microvolt = <3300000>;
-
+				regulator-always-on;
+				regulator-boot-on;
 				regulator-state-mem {
 					regulator-off-in-suspend;
 				};
@@ -383,7 +406,7 @@
 					regulator-off-in-suspend;
 				};
 			};
-
+			
 			vcc3v3_sd: SWITCH_REG2 {
 				regulator-name = "vcc3v3_sd";
 				regulator-always-on;
@@ -429,8 +452,8 @@
 	pinctrl-names = "default";
 	pinctrl-0 = <&pcie_reset_h>;
 	reset-gpios = <&gpio4 RK_PC6 GPIO_ACTIVE_HIGH>;
-	status = "okay";
-	
+	status = "disabled";
+
 	pcie@0,0 {
 		reg = <0x00000000 0 0 0 0>;
 		#address-cells = <3>;
@@ -488,10 +511,14 @@
 			rockchip,pins = <0 RK_PD3 RK_FUNC_GPIO &pcfg_pull_up>;
 		};
 	};
+	/* -------------------------- RTL8723 WiFi引脚复用配置 -------------------------- */
+	wifi {
+		wifi_enable_h: wifi-enable-h {
+			rockchip,pins = <2 RK_PB1 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
 
-	usb {
-		vcc5v0_usb_host_en: vcc5v0-usb-host-en {
-			rockchip,pins = <0 RK_PA6 RK_FUNC_GPIO &pcfg_pull_none>;
+		wifi_wake_host_h: wifi-wake-host-h {
+			rockchip,pins = <2 RK_PB2 RK_FUNC_GPIO &pcfg_pull_none>;
 		};
 	};
 };
@@ -538,8 +565,35 @@
 	status = "okay";
 };
 
+&uart0 {
+	status = "okay";
+};
+
+&uart1 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart1m0_xfer &uart1m0_rtsn &uart1m0_ctsn>;
+	uart-hw-flowctrl;                 // 开启硬件RTS/CTS流控
+};
+
 &uart2 {
 	status = "okay";
+};
+
+&uart3 {
+	status = "okay";
+};
+
+&uart7 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart7m2_xfer>;
+};
+
+&uart9 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart9m2_xfer>;
 };
 
 &usb2phy0 {
@@ -552,24 +606,103 @@
 };
 
 &usb2phy0_otg {
+	phy-supply = <&vcc5v0_usb>;
+	status = "okay";
+};
+
+&usb2phy1 {
+	status = "okay";
+};
+
+&usb2phy1_host {
+	phy-supply = <&vcc5v0_usb>;
+	status = "okay";
+};
+
+&usb2phy1_otg {
+	phy-supply = <&vcc5v0_usb>;
 	status = "okay";
 };
 
 &usb_host0_xhci {
+	phy-supply = <&vcc5v0_usb>;
 	extcon = <&usb2phy0>;
 	status = "okay";
 };
+
+/*
+&usb_host0_xhci {
+	phys = <&usb2phy0_otg>;
+	phy-names = "usb2-phy";
+	extcon = <&usb2phy0>;
+	maximum-speed = "high-speed";
+};
+*/
 
 &usb_host1_xhci {
 	status = "okay";
 };
 
+// 启用第一个USB2.0 Host控制器
+&usb_host0_ehci {
+    status = "okay";
+    phys = <&usb2phy1>;
+    phy-names = "usb";
+	xtcon = <&usb2phy1>;
+    phy-supply = <&vcc5v0_usb>;
+};
+
+&usb_host0_ohci {
+    status = "okay";
+    phys = <&usb2phy1>;
+	xtcon = <&usb2phy1>;
+    phy-names = "usb";
+	phy-supply = <&vcc5v0_usb>;
+};
+
+// 启用第二个USB2.0 Host控制器
+&usb_host1_ehci {
+    status = "okay";
+    phys = <&usb2phy1>;
+    phy-names = "usb";
+	xtcon = <&usb2phy1>;
+    phy-supply = <&vcc5v0_usb>;
+};
+
+&usb_host1_ohci {
+    status = "okay";
+    phys = <&usb2phy1>;
+    phy-names = "usb";
+	xtcon = <&usb2phy1>;
+	phy-supply = <&vcc5v0_usb>;
+};
+
 &vop {
 	assigned-clocks = <&cru DCLK_VOP0>, <&cru DCLK_VOP1>;
 	assigned-clock-parents = <&pmucru PLL_HPLL>, <&cru PLL_VPLL>;
-	status = "okay";
+	status = "disabled";
 };
 
 &vop_mmu {
+	status = "disabled";
+};
+
+/* -------------------------- RTL8723 WiFi SDIO总线节点 -------------------------- */
+&sdmmc1 {
+	bus-width = <4>;
+	// cap-sd-highspeed;
+	cap-sdio-irq;
+	keep-power-in-suspend;
+	mmc-pwrseq = <&sdio_pwrseq>;
+	no-mmc;
+	no-sd;
+	non-removable;
+	pinctrl-names = "default";
+	pinctrl-0 = <&sdmmc1_bus4 &sdmmc1_clk &sdmmc1_cmd>;
+	// sd-uhs-sdr104;
+	no-sdio-tuning;
+	max-frequency = <50000000>; /* 强制50MHz SDIO标准频率 */
+	vmmc-supply = <&vcc_3v3>;
+	vqmmc-supply = <&vcc_3v3>;
 	status = "okay";
 };
