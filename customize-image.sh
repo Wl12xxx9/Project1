@@ -19,22 +19,6 @@ BUILD_DESKTOP=$4
 
 Main() {
 	case $RELEASE in
-		stretch)
-			# your code here
-			# InstallOpenMediaVault # uncomment to get an OMV 4 image
-			;;
-		buster)
-			# your code here
-			;;
-		bullseye)
-			# your code here
-			;;
-		bionic)
-			# your code here
-			;;
-		focal)
-			# your code here
-			;;
 		noble)
 			# ====================== 新增这里 ======================
 			# 1. 核心：删除首次开机标记，彻底禁用所有向导
@@ -55,6 +39,52 @@ Main() {
 			# 5. 禁用首次运行systemd服务（双重保险）
 			# systemctl disable --now armbian-firstrun-config 2>/dev/null
 			# ======================================================
+
+			###########################################################################
+			# 1. 禁用冗余 systemd 自启服务
+			###########################################################################
+			DISABLE_SERVICES=(
+				NetworkManager NetworkManager-dispatcher NetworkManager-wait-online
+				openvpn 
+			)
+
+			for svc in "${DISABLE_SERVICES[@]}"; do
+				systemctl disable "$svc.service"
+			done
+
+			###########################################################################
+			# 5. 双网口静态IP（替代 NetworkManager）
+			###########################################################################
+			# cat > /etc/network/interfaces << EOF
+			# auto eth0
+			# iface eth0 inet static
+			#     address 192.168.1.100
+			#     netmask 255.255.255.0
+			#     gateway 192.168.1.1
+			#     dns-nameservers 223.5.5.5
+
+			# auto eth1
+			# iface eth1 inet static
+			#     address 192.168.2.100
+			#     netmask 255.255.255.0
+			# EOF
+
+			;;
+		stretch)
+			# your code here
+			# InstallOpenMediaVault # uncomment to get an OMV 4 image
+			;;
+		buster)
+			# your code here
+			;;
+		bullseye)
+			# your code here
+			;;
+		bionic)
+			# your code here
+			;;
+		focal)
+			# your code here
 			;;
 	esac
 } # Main
