@@ -43,14 +43,14 @@ Main() {
 			###########################################################################
 			# 1. 禁用冗余 systemd 自启服务
 			###########################################################################
-			DISABLE_SERVICES=(
-				NetworkManager NetworkManager-dispatcher NetworkManager-wait-online
-				openvpn 
-			)
+			# DISABLE_SERVICES=(
+			# 	NetworkManager NetworkManager-dispatcher NetworkManager-wait-online
+			# 	openvpn 
+			# )
 
-			for svc in "${DISABLE_SERVICES[@]}"; do
-				systemctl disable "$svc.service"
-			done
+			# for svc in "${DISABLE_SERVICES[@]}"; do
+			# 	systemctl disable "$svc.service"
+			# done
 
 			###########################################################################
 			# 5. 双网口静态IP（替代 NetworkManager）
@@ -69,6 +69,35 @@ Main() {
 			#     netmask 255.255.255.0
 			# EOF
 
+			# ========== USB自动挂载 开始 ==========
+			# DEBIAN_FRONTEND=noninteractive apt-get install -y exfat-fuse exfat-utils
+
+			# 写入 USB 自动挂载 udev 规则
+# cat > /etc/udev/rules.d/99-usb-automount.rules << EOF
+# ACTION=="add", SUBSYSTEM=="block", KERNEL=="sd[a-z]*[0-9]", SUBSYSTEMS=="usb",
+#   RUN{program}+="/bin/mkdir -p /media/usb-%k",
+#   RUN{program}+="/usr/bin/systemd-mount --no-block --collect \$devnode /media/usb-%k"
+
+# ACTION=="remove", SUBSYSTEM=="block", KERNEL=="sd[a-z]*[0-9]", SUBSYSTEMS=="usb",
+#   RUN{program}+="/usr/bin/systemd-umount /media/usb-%k",
+#   RUN{program}+="/bin/rmdir /media/usb-%k"
+# EOF
+
+			# udevadm control --reload-rules
+			# ========== USB自动挂载 结束 ==========
+
+			# ========== chroot 内编译 AIC8800 SDIO 驱动 ==========
+			# 定义路径（替换为你本地真实路径）
+			# export ARMBIAN_ROOT="/home/qiaoxi/project/armbian-build/build"
+			# export KERNEL_PATH="${ARMBIAN_ROOT}/cache/sources/linux-kernel-worktree/6.18__rockchip64__arm64"
+			# export AIC_DRIVER="${ARMBIAN_ROOT}/userpatches/overlay/opt/aic8800"
+
+			# # 进入驱动目录编译
+			# cd ${AIC_DRIVER}
+			# make clean
+			# # 标准交叉编译指令
+			# make -C ${KERNEL_PATH} M=$(pwd) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules
+			# =====================================================
 			;;
 		stretch)
 			# your code here
