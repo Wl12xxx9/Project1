@@ -17,6 +17,26 @@ LINUXFAMILY=$2
 BOARD=$3
 BUILD_DESKTOP=$4
 
+# ===================== 新增：USB自动挂载独立函数 =====================
+SetupUsbAutoMount() {
+	# 非交互模式安装依赖
+	DEBIAN_FRONTEND=noninteractive apt-get install -y --no-upgrade --no-install-recommends exfatprogs
+
+	# 写入 udev 自动挂载规则
+	cat > /etc/udev/rules.d/99-usb-automount.rules << EOF
+ACTION=="add", SUBSYSTEM=="block", SUBSYSTEMS=="usb", KERNEL=="sd[a-z][0-9]", 
+RUN+="/bin/mkdir -p /media/usb-%k", 
+RUN+="/usr/bin/systemd-mount --no-block --collect -o uid=0,gid=0,umask=000 /dev/%k /media/usb-%k"
+
+ACTION=="remove", SUBSYSTEM=="block", SUBSYSTEMS=="usb", KERNEL=="sd[a-z][0-9]", 
+RUN+="/usr/bin/systemd-umount --lazy /media/usb-%k"
+EOF
+
+	# 重载udev规则
+	udevadm control --reload-rules
+}
+# ======================================================================
+
 Main() {
 	case $RELEASE in
 		noble)
@@ -70,20 +90,7 @@ Main() {
 			# EOF
 
 			# ========== USB自动挂载 开始 ==========
-			# DEBIAN_FRONTEND=noninteractive apt-get install -y exfat-fuse exfat-utils
-
-			# 写入 USB 自动挂载 udev 规则
-# cat > /etc/udev/rules.d/99-usb-automount.rules << EOF
-# ACTION=="add", SUBSYSTEM=="block", KERNEL=="sd[a-z]*[0-9]", SUBSYSTEMS=="usb",
-#   RUN{program}+="/bin/mkdir -p /media/usb-%k",
-#   RUN{program}+="/usr/bin/systemd-mount --no-block --collect \$devnode /media/usb-%k"
-
-# ACTION=="remove", SUBSYSTEM=="block", KERNEL=="sd[a-z]*[0-9]", SUBSYSTEMS=="usb",
-#   RUN{program}+="/usr/bin/systemd-umount /media/usb-%k",
-#   RUN{program}+="/bin/rmdir /media/usb-%k"
-# EOF
-
-			# udevadm control --reload-rules
+			SetupUsbAutoMount
 			# ========== USB自动挂载 结束 ==========
 
 			# ========== chroot 内编译 AIC8800 SDIO 驱动 ==========
