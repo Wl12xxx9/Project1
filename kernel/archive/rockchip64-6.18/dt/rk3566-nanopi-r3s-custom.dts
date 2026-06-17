@@ -596,21 +596,30 @@
 	pinctrl-0 = <&uart9m2_xfer>;
 };
 
-&usb2phy0 {
-	status = "okay";
-};
-
 &usb2phy0_host {
 	phy-supply = <&vcc5v0_usb>;
 	status = "okay";
 };
 
+&usb2phy0 {
+	#phy-cells = <1>;
+	status = "okay";
+};
+
 &usb2phy0_otg {
+	#phy-cells = <1>;
 	phy-supply = <&vcc5v0_usb>;
 	status = "okay";
 };
 
 &usb2phy1 {
+	#phy-cells = <1>;
+	status = "okay";
+};
+
+&usb2phy1_otg {
+	#phy-cells = <1>;
+	phy-supply = <&vcc5v0_usb>;
 	status = "okay";
 };
 
@@ -619,25 +628,14 @@
 	status = "okay";
 };
 
-&usb2phy1_otg {
-	phy-supply = <&vcc5v0_usb>;
-	status = "okay";
-};
-
 &usb_host0_xhci {
-	phy-supply = <&vcc5v0_usb>;
-	extcon = <&usb2phy0>;
-	status = "okay";
+    phys = <&usb2phy0_otg>;
+    phy-names = "usb2-phy";
+    extcon = <&usb2phy0>;
+    maximum-speed = "high-speed";
+    phy-supply = <&vcc5v0_usb>;
+    status = "okay";
 };
-
-/*
-&usb_host0_xhci {
-	phys = <&usb2phy0_otg>;
-	phy-names = "usb2-phy";
-	extcon = <&usb2phy0>;
-	maximum-speed = "high-speed";
-};
-*/
 
 &usb_host1_xhci {
 	status = "okay";
@@ -645,35 +643,35 @@
 
 // 启用第一个USB2.0 Host控制器
 &usb_host0_ehci {
-    status = "okay";
-    phys = <&usb2phy1>;
-    phy-names = "usb";
-	xtcon = <&usb2phy1>;
-    phy-supply = <&vcc5v0_usb>;
+	status = "okay";
+	phys = <&usb2phy1_otg>;  // 对齐底层，原 usb2phy1 → 改为 usb2phy1_otg
+	phy-names = "usb";
+	extcon = <&usb2phy1>;    // 保留不变
+	phy-supply = <&vcc5v0_usb>;
 };
 
 &usb_host0_ohci {
-    status = "okay";
-    phys = <&usb2phy1>;
-	xtcon = <&usb2phy1>;
-    phy-names = "usb";
+	status = "okay";
+	phys = <&usb2phy1_otg>;  // 关键修正，对齐底层
+	phy-names = "usb";
+	extcon = <&usb2phy1>;
 	phy-supply = <&vcc5v0_usb>;
 };
 
 // 启用第二个USB2.0 Host控制器
 &usb_host1_ehci {
-    status = "okay";
-    phys = <&usb2phy1>;
-    phy-names = "usb";
-	xtcon = <&usb2phy1>;
-    phy-supply = <&vcc5v0_usb>;
+	status = "okay";
+	phys = <&usb2phy1_otg>;
+	phy-names = "usb";
+	extcon = <&usb2phy1>;
+	phy-supply = <&vcc5v0_usb>;
 };
 
 &usb_host1_ohci {
-    status = "okay";
-    phys = <&usb2phy1>;
-    phy-names = "usb";
-	xtcon = <&usb2phy1>;
+	status = "okay";
+	phys = <&usb2phy1_otg>;
+	phy-names = "usb";
+	extcon = <&usb2phy1>;
 	phy-supply = <&vcc5v0_usb>;
 };
 
