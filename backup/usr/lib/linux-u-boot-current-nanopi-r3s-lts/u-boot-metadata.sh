@@ -1,0 +1,13 @@
+declare -i UBOOT_NUM_TARGETS=1
+declare UBOOT_BIN_DIR="/usr/lib/linux-u-boot-current-nanopi-r3s-lts"
+declare UBOOT_VERSION="2026.04"
+declare UBOOT_ARTIFACT_VERSION="2026.04-S88dc-Pa89e-H16c2-V58ee-Bd0d2-R448a"
+declare UBOOT_GIT_REVISION="88dc2788777babfd6322fa655df549a019aa1e69"
+declare UBOOT_GIT_SOURCE="https://github.com/u-boot/u-boot"
+declare UBOOT_GIT_BRANCH="tag:v2026.04"
+declare UBOOT_GIT_PATCHDIR="v2026.04"
+declare UBOOT_PARTITION_TYPE="gpt"
+declare UBOOT_KERNEL_DTB="rockchip/rk3566-nanopi-r3s-lts.dtb"
+declare UBOOT_KERNEL_SERIALCON="ttyS2"
+declare UBOOT_EXTLINUX_PREFER="no"
+declare UBOOT_EXTLINUX_CMDLINE=""

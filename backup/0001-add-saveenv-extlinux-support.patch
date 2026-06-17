@@ -1,0 +1,14 @@
+diff --git a/configs/nanopi-r3s-lts-rk3566_defconfig b/configs/nanopi-r3s-lts-rk3566_defconfig
+index aaadced..8641b6c 100644
+--- a/configs/nanopi-r3s-lts-rk3566_defconfig
++++ b/configs/nanopi-r3s-lts-rk3566_defconfig
+@@ -71,4 +71,7 @@ CONFIG_USB=y
+ CONFIG_USB_XHCI_HCD=y
+ CONFIG_USB_DWC3=y
+ CONFIG_USB_DWC3_GENERIC=y
+-CONFIG_ERRNO_STR=y
+\ No newline at end of file
++CONFIG_ERRNO_STR=y
++CONFIG_CMD_SAVEENV=y
++CONFIG_CMD_EXTLINUX=y
++CONFIG_DISTRO_DEFAULTS=y
