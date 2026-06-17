@@ -18,6 +18,7 @@
 #include <linux/syscalls.h>
 #include <linux/syscore_ops.h>
 #include <linux/uaccess.h>
+#include <linux/delay.h>
 
 /*
  * this indicates whether you can reboot with ctrl-alt-del: the default is yes
@@ -300,6 +301,12 @@ static void do_kernel_restart_prepare(void)
 // EXPORT_SYMBOL_GPL(kernel_restart);
 void kernel_restart(char *cmd)
 {
+	pr_crit("[REBOOT_DEBUG] kernel_restart enter, release CPU before device shutdown\n");
+	// 新增：提前调度+延时，消化RCU、MMC残留DMA、软中断
+	cond_resched();
+	msleep(150);
+	cond_resched();
+
 	kernel_restart_prepare(cmd);
 	do_kernel_restart_prepare();
 	migrate_to_reboot_cpu();

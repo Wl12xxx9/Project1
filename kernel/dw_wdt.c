@@ -285,15 +285,42 @@ static int dw_wdt_start(struct watchdog_device *wdd)
 static int dw_wdt_stop(struct watchdog_device *wdd)
 {
 	struct dw_wdt *dw_wdt = to_dw_wdt(wdd);
+	int ret;
 
-	if (!dw_wdt->rst) {
+	pr_crit("[WDT_DEBUG] dw_wdt_stop enter, system_state=%d\n", system_state);
+
+	// 已标记硬件运行，直接退出
+	if (test_bit(WDOG_HW_RUNNING, &wdd->status)) {
+		pr_crit("[WDT_DEBUG] HW_RUNNING already set, skip repeat stop\n");
+		return 0;
+	}
+
+	// 重启/关机场景，标记硬件运行，直接返回
+	if (system_state == SYSTEM_RESTART || system_state == SYSTEM_HALT || 
+		system_state == SYSTEM_POWER_OFF) {
+		pr_crit("[WDT_DEBUG] hit reboot/halt, skip reset logic\n");
 		set_bit(WDOG_HW_RUNNING, &wdd->status);
 		return 0;
 	}
 
-	reset_control_assert(dw_wdt->rst);
-	reset_control_deassert(dw_wdt->rst);
+	if (!dw_wdt->rst) {
+		pr_crit("[WDT_DEBUG] no rst resource, set HW_RUNNING\n");
+		set_bit(WDOG_HW_RUNNING, &wdd->status);
+		return 0;
+	}
 
+	ret = reset_control_assert(dw_wdt->rst);
+	if (ret) {
+		pr_crit("[WDT_DEBUG] reset assert fail, ret=%d\n", ret);
+		return ret;
+	}
+	ret = reset_control_deassert(dw_wdt->rst);
+	if (ret) {
+		pr_crit("[WDT_DEBUG] reset deassert fail, ret=%d\n", ret);
+		return ret;
+	}
+
+	pr_crit("[WDT_DEBUG] dw_wdt_stop exit, ret=0\n");
 	return 0;
 }
 
@@ -676,6 +703,20 @@ static void dw_wdt_drv_remove(struct platform_device *pdev)
 	reset_control_assert(dw_wdt->rst);
 }
 
+static void dw_wdt_shutdown(struct platform_device *pdev)
+{
+    struct dw_wdt *dw_wdt = platform_get_drvdata(pdev);
+    struct watchdog_device *wdd = &dw_wdt->wdd;
+
+    pr_crit("[WDT_DEBUG] dw_wdt_shutdown enter, system_state=%d\n", system_state);
+
+    // 重启/关机场景：不执行复位操作，避免总线阻塞卡死
+    // 保持看门狗硬件运行，若系统重启卡死可自动复位兜底
+    set_bit(WDOG_HW_RUNNING, &wdd->status);
+
+    pr_crit("[WDT_DEBUG] dw_wdt_shutdown exit, watchdog keep running\n");
+}
+
 #ifdef CONFIG_OF
 static const struct of_device_id dw_wdt_of_match[] = {
 	{ .compatible = "snps,dw-wdt", },
@@ -687,6 +728,7 @@ MODULE_DEVICE_TABLE(of, dw_wdt_of_match);
 static struct platform_driver dw_wdt_driver = {
 	.probe		= dw_wdt_drv_probe,
 	.remove		= dw_wdt_drv_remove,
+	.shutdown   = dw_wdt_shutdown, 
 	.driver		= {
 		.name	= "dw_wdt",
 		.of_match_table = of_match_ptr(dw_wdt_of_match),

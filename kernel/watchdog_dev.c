@@ -293,10 +293,15 @@ static int watchdog_stop(struct watchdog_device *wdd)
 {
 	int err = 0;
 
-	if (!watchdog_active(wdd))
+	pr_crit("[WDT_DEBUG] watchdog_stop enter\n");
+
+	if (!watchdog_active(wdd)) {
+		pr_crit("[WDT_DEBUG] watchdog not active, return 0\n");
 		return 0;
+	}
 
 	if (test_bit(WDOG_NO_WAY_OUT, &wdd->status)) {
+		pr_crit("[WDT_DEBUG] hit nowayout, return -EBUSY\n");
 		pr_info("watchdog%d: nowayout prevents watchdog being stopped!\n",
 			wdd->id);
 		return -EBUSY;
@@ -304,10 +309,13 @@ static int watchdog_stop(struct watchdog_device *wdd)
 
 	if (wdd->ops->stop) {
 		clear_bit(WDOG_HW_RUNNING, &wdd->status);
+		pr_crit("[WDT_DEBUG] call low-level stop\n");
 		err = wdd->ops->stop(wdd);
+		pr_crit("[WDT_DEBUG] low-level stop return err=%d\n", err);
 		trace_watchdog_stop(wdd, err);
 	} else {
 		set_bit(WDOG_HW_RUNNING, &wdd->status);
+		pr_crit("[WDT_DEBUG] no stop op, set HW_RUNNING\n");
 	}
 
 	if (err == 0) {
@@ -316,6 +324,7 @@ static int watchdog_stop(struct watchdog_device *wdd)
 		watchdog_hrtimer_pretimeout_stop(wdd);
 	}
 
+	pr_crit("[WDT_DEBUG] watchdog_stop exit, err=%d\n", err);
 	return err;
 }
 
@@ -945,6 +954,9 @@ static int watchdog_release(struct inode *inode, struct file *file)
 	struct watchdog_device *wdd;
 	int err = -EBUSY;
 	bool running;
+	bool skip_stop = false;
+	// 提前缓存系统状态，避免多次读取时序漂移
+	int curr_system_state = system_state;
 
 	mutex_lock(&wd_data->lock);
 
@@ -952,42 +964,58 @@ static int watchdog_release(struct inode *inode, struct file *file)
 	if (!wdd)
 		goto done;
 
-	/*
-	 * We only stop the watchdog if we received the magic character
-	 * or if WDIOF_MAGICCLOSE is not set. If nowayout was set then
-	 * watchdog_stop will fail.
-	 */
+	pr_crit("[WDT_DEBUG] release enter, curr_system_state=%d\n", curr_system_state);
+	pr_crit("[WDT_DEBUG] other_system_state: %d, %d, %d\n", SYSTEM_RESTART, SYSTEM_HALT, SYSTEM_POWER_OFF);
+	if (system_state == SYSTEM_RESTART || system_state == SYSTEM_HALT || 
+		system_state == SYSTEM_POWER_OFF) {
+		pr_crit("[WDT_DEBUG] reboot/halt mark skip_stop\n");
+		skip_stop = true;
+	}
+
+	/* stop逻辑仅正常运行时执行 */
 	if (!watchdog_active(wdd))
 		err = 0;
-	else if (test_and_clear_bit(_WDOG_ALLOW_RELEASE, &wd_data->status) ||
-		 !(wdd->info->options & WDIOF_MAGICCLOSE))
+	else if (!skip_stop && (test_and_clear_bit(_WDOG_ALLOW_RELEASE, &wd_data->status) ||
+		 !(wdd->info->options & WDIOF_MAGICCLOSE)))
 		err = watchdog_stop(wdd);
+
+	if (!skip_stop) {
+		pr_crit("[WDT_DEBUG] watchdog_stop return err=%d\n", err);
+	}
 
 	/* If the watchdog was not stopped, send a keepalive ping */
 	if (err < 0) {
 		pr_crit("watchdog%d: watchdog did not stop!\n", wdd->id);
-		watchdog_ping(wdd);
+		pr_crit("[WDT_DEBUG] err<0, nowayout=%d, magicclose=%d\n",
+				test_bit(WDOG_NO_WAY_OUT, &wdd->status),
+				!!(wdd->info->options & WDIOF_MAGICCLOSE));
+
+		// 仅非 magic close 场景的真正停止失败，才喂狗续命
+		// magic close 是用户态主动不停止，不需要额外喂狗，避免重启时误续命
+		if (!(wdd->info->options & WDIOF_MAGICCLOSE)) {
+			pr_crit("[WDT_DEBUG] non-magicclose stop failure, execute watchdog_ping\n");
+			watchdog_ping(wdd);
+		} else {
+			pr_crit("[WDT_DEBUG] magicclose mode, skip watchdog_ping\n");
+		}
 	}
 
 	watchdog_update_worker(wdd);
-
-	/* make sure that /dev/watchdog can be re-opened */
 	clear_bit(_WDOG_DEV_OPEN, &wd_data->status);
 
 done:
 	running = wdd && watchdog_hw_running(wdd);
 	mutex_unlock(&wd_data->lock);
-	/*
-	 * Allow the owner module to be unloaded again unless the watchdog
-	 * is still running. If the watchdog is still running, it can not
-	 * be stopped, and its driver must not be unloaded.
-	 */
+
 	if (!running) {
 		module_put(wd_data->cdev.owner);
 		put_device(&wd_data->dev);
 	}
+
+	pr_crit("[WDT_DEBUG] watchdog_release exit\n");
 	return 0;
 }
+
 
 static const struct file_operations watchdog_fops = {
 	.owner		= THIS_MODULE,
