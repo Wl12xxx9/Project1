@@ -63,6 +63,8 @@ Main() {
 			###########################################################################
 			# 1. 禁用冗余 systemd 自启服务
 			###########################################################################
+			# systemctl disable NetworkManager-wait-online.service
+			# systemctl daemon-reload
 			# DISABLE_SERVICES=(
 			# 	NetworkManager NetworkManager-dispatcher NetworkManager-wait-online
 			# 	openvpn 
@@ -71,6 +73,15 @@ Main() {
 			# for svc in "${DISABLE_SERVICES[@]}"; do
 			# 	systemctl disable "$svc.service"
 			# done
+
+			# 屏蔽网络等待服务，解决开机卡顿
+			ln -sf /dev/null /etc/systemd/system/systemd-networkd-wait-online.service
+			ln -sf /dev/null /etc/systemd/system/NetworkManager-wait-online.service
+			# 屏蔽无网卡依赖的 vnstat 服务
+			ln -sf /dev/null /etc/systemd/system/vnstat.service
+			# 可选：屏蔽其他启动报错的冗余服务
+			ln -sf /dev/null /etc/systemd/system/armbian-zram-config.service
+			ln -sf /dev/null /etc/systemd/system/smartmontools.service
 
 			###########################################################################
 			# 5. 双网口静态IP（替代 NetworkManager）
@@ -90,7 +101,7 @@ Main() {
 			# EOF
 
 			# ========== USB自动挂载 开始 ==========
-			SetupUsbAutoMount
+			# SetupUsbAutoMount
 			# ========== USB自动挂载 结束 ==========
 
 			# ========== chroot 内编译 AIC8800 SDIO 驱动 ==========
