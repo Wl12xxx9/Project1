@@ -40,7 +40,7 @@ EOF
 Main() {
 	case $RELEASE in
 		noble)
-			# ====================== 新增这里 ======================
+			# ====================== 开机向导屏蔽 ======================
 			# 1. 核心：删除首次开机标记，彻底禁用所有向导
 			rm /root/.not_logged_in_yet
 
@@ -60,9 +60,31 @@ Main() {
 			# systemctl disable --now armbian-firstrun-config 2>/dev/null
 			# ======================================================
 
+
+			# 引用独立脚本：部署 RTL8821CS 增强版WiFi驱动
+			# 仅 NanoPi R3S-LTS 板型执行
+			# ==============================================================
+			# if [[ "${BOARD}" == "nanopi-r3s-lts" ]]; then
+			#     # 获取当前脚本所在目录，拼接独立脚本的绝对路径
+			#     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+			#     source "${SCRIPT_DIR}/deploy-rtw88-lwfinger.sh" "$1"
+			# 	# 自动获取当前脚本所在目录，精准定位同目录下的依赖脚本
+			# 	# bash "$(dirname "$0")/deploy-rtw88-lwfinger.sh"
+			# fi
+			bash /tmp/overlay/deploy-rtw88-lwfinger.sh
+			
+			# 修复boot.scr镜像格式问题
+			echo "[BOOT] 重新生成U-Boot启动脚本boot.scr"
+			cd /boot
+			# 重新生成boot.cmd并打包成合法U-Boot镜像boot.scr
+			armbian-create-u-boot-script
+			sync
+
 			###########################################################################
-			# 1. 禁用冗余 systemd 自启服务
+			# 禁用冗余 systemd 自启服务
 			###########################################################################
+			# systemctl disable NetworkManager-wait-online.service
+			# systemctl daemon-reload
 			# DISABLE_SERVICES=(
 			# 	NetworkManager NetworkManager-dispatcher NetworkManager-wait-online
 			# 	openvpn 
@@ -72,8 +94,17 @@ Main() {
 			# 	systemctl disable "$svc.service"
 			# done
 
+			# 屏蔽网络等待服务，解决开机卡顿
+			ln -sf /dev/null /etc/systemd/system/systemd-networkd-wait-online.service
+			ln -sf /dev/null /etc/systemd/system/NetworkManager-wait-online.service
+			# 屏蔽无网卡依赖的 vnstat 服务
+			ln -sf /dev/null /etc/systemd/system/vnstat.service
+			# 可选：屏蔽其他启动报错的冗余服务
+			ln -sf /dev/null /etc/systemd/system/armbian-zram-config.service
+			ln -sf /dev/null /etc/systemd/system/smartmontools.service
+
 			###########################################################################
-			# 5. 双网口静态IP（替代 NetworkManager）
+			# 双网口静态IP（替代 NetworkManager）
 			###########################################################################
 			# cat > /etc/network/interfaces << EOF
 			# auto eth0
@@ -90,7 +121,7 @@ Main() {
 			# EOF
 
 			# ========== USB自动挂载 开始 ==========
-			SetupUsbAutoMount
+			# SetupUsbAutoMount
 			# ========== USB自动挂载 结束 ==========
 
 			# ========== chroot 内编译 AIC8800 SDIO 驱动 ==========
