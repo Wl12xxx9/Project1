@@ -130,9 +130,13 @@
 		clock-names = "ext_clock";
 		pinctrl-names = "default";
 		pinctrl-0 = <&wifi_enable_h>;
-		post-power-on-delay-ms = <300>;
-		power-off-delay-us = <3000000>;
+		// 加长上电稳定等待时间，RTL8821CS上电初始化比AIC慢很多
+		post-power-on-delay-ms = <600>;
+		// 加长掉电保持时间，避免复位残留电压干扰下次上电
+		power-off-delay-us = <5000000>;
 		reset-gpios = <&gpio2 RK_PB1 GPIO_ACTIVE_LOW>;
+		// 新增：复位释放后额外延时，等待WiFi芯片内部PLL稳定
+		post-reset-delay-ms = <200>;
 	};
 };
 
@@ -596,12 +600,12 @@
 	pinctrl-0 = <&uart9m2_xfer>;
 };
 
-&usb2phy0 {
+&usb2phy0_host {
+	phy-supply = <&vcc5v0_usb>;
 	status = "okay";
 };
 
-&usb2phy0_host {
-	phy-supply = <&vcc5v0_usb>;
+&usb2phy0 {
 	status = "okay";
 };
 
@@ -614,30 +618,24 @@
 	status = "okay";
 };
 
-&usb2phy1_host {
-	phy-supply = <&vcc5v0_usb>;
-	status = "okay";
-};
-
 &usb2phy1_otg {
 	phy-supply = <&vcc5v0_usb>;
 	status = "okay";
 };
 
-&usb_host0_xhci {
+&usb2phy1_host {
 	phy-supply = <&vcc5v0_usb>;
-	extcon = <&usb2phy0>;
 	status = "okay";
 };
 
-/*
 &usb_host0_xhci {
-	phys = <&usb2phy0_otg>;
-	phy-names = "usb2-phy";
-	extcon = <&usb2phy0>;
-	maximum-speed = "high-speed";
+    phys = <&usb2phy0_otg>;
+    phy-names = "usb2-phy";
+    extcon = <&usb2phy0>;
+    maximum-speed = "high-speed";
+    phy-supply = <&vcc5v0_usb>;
+    status = "okay";
 };
-*/
 
 &usb_host1_xhci {
 	status = "okay";
@@ -645,35 +643,23 @@
 
 // 启用第一个USB2.0 Host控制器
 &usb_host0_ehci {
-    status = "okay";
-    phys = <&usb2phy1>;
-    phy-names = "usb";
-	xtcon = <&usb2phy1>;
-    phy-supply = <&vcc5v0_usb>;
+	status = "okay";
+	phy-supply = <&vcc5v0_usb>;
 };
 
 &usb_host0_ohci {
-    status = "okay";
-    phys = <&usb2phy1>;
-	xtcon = <&usb2phy1>;
-    phy-names = "usb";
+	status = "okay";
 	phy-supply = <&vcc5v0_usb>;
 };
 
 // 启用第二个USB2.0 Host控制器
 &usb_host1_ehci {
-    status = "okay";
-    phys = <&usb2phy1>;
-    phy-names = "usb";
-	xtcon = <&usb2phy1>;
-    phy-supply = <&vcc5v0_usb>;
+	status = "okay";
+	phy-supply = <&vcc5v0_usb>;
 };
 
 &usb_host1_ohci {
-    status = "okay";
-    phys = <&usb2phy1>;
-    phy-names = "usb";
-	xtcon = <&usb2phy1>;
+	status = "okay";
 	phy-supply = <&vcc5v0_usb>;
 };
 
@@ -690,18 +676,26 @@
 /* -------------------------- RTL8723 WiFi SDIO总线节点 -------------------------- */
 &sdmmc1 {
 	bus-width = <4>;
-	// cap-sd-highspeed;
 	cap-sdio-irq;
 	keep-power-in-suspend;
 	mmc-pwrseq = <&sdio_pwrseq>;
 	no-mmc;
 	no-sd;
+	no-1-8-v;
 	non-removable;
 	pinctrl-names = "default";
 	pinctrl-0 = <&sdmmc1_bus4 &sdmmc1_clk &sdmmc1_cmd>;
-	// sd-uhs-sdr104;
 	no-sdio-tuning;
-	max-frequency = <50000000>; /* 强制50MHz SDIO标准频率 */
+	max-frequency = <50000000>;
+	// 新增：关闭UHS/高速SDIO，强制标准SDIO模式
+	no-sdio-highspeed;
+	no-sdio-uhs;
+	// 新增：禁用DMA批量突发传输，避免连续写固件超时
+	cap-dma = <0>;
+	// 新增：RK3566 专用SDIO时钟采样相位偏移，适配Realtek严苛时序
+	clk-phase-sample = <90>;
+	clk-phase-drive = <0>;
+	// 供电拆分优化：不要和外设共用3V3，若硬件无独立供电，保留但加补偿
 	vmmc-supply = <&vcc_3v3>;
 	vqmmc-supply = <&vcc_3v3>;
 	status = "okay";
