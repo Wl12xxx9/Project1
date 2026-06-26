@@ -37,6 +37,206 @@ EOF
 }
 # ======================================================================
 
+
+# ==================================================
+# 镜像瘦身优化函数
+# 适配硬件：RK3566 + AIC8800/RTL8821CS双WiFi+蓝牙 + USB网卡 + STM32 USB-CAN + UART + SD卡
+# ==================================================
+image_slim_optimize() {
+    local GREEN='\033[32m'
+    local YELLOW='\033[33m'
+    local RESET='\033[0m'
+
+    echo -e "${GREEN}[镜像瘦身] ==========================================${RESET}"
+    echo -e "${GREEN}[镜像瘦身] 开始执行系统精简优化...${RESET}"
+    echo -e "${GREEN}[镜像瘦身] ==========================================${RESET}"
+
+    # --------------------------
+    # 1. 基础系统配置
+    # --------------------------
+    echo -e "\n${YELLOW}[1/7] 配置基础系统（跳过向导、预置账号时区）${RESET}"
+    
+    # 删除首次开机标记，禁用所有初始化向导
+    rm -f /root/.not_logged_in_yet
+    echo "[镜像瘦身] 已禁用首次登录向导"
+
+    # 预置root密码
+    echo "root:123" | chpasswd
+    echo "[镜像瘦身] 已预置root默认密码"
+
+    # 预置上海时区（需要则取消注释）
+    # ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+    # echo "Asia/Shanghai" > /etc/timezone
+    # echo "[镜像瘦身] 已设置时区为 Asia/Shanghai"
+
+    # --------------------------
+    # 2. APT体系全量清理
+    # --------------------------
+    echo -e "\n${YELLOW}[2/7] 清理APT缓存与索引文件${RESET}"
+    
+    # 清理下载的deb包缓存
+    apt clean -y > /dev/null 2>&1
+    rm -rf /var/cache/apt/*.bin
+    echo "[镜像瘦身] 已清理APT二进制缓存"
+
+    # 清理软件源索引列表
+    rm -rf /var/lib/apt/lists/*
+    echo "[镜像瘦身] 已清理APT源索引列表"
+
+    # 成品机禁用APT缓存生成（可选，需要则取消注释）
+    # cat > /etc/apt/apt.conf.d/00_disable_cache <<EOF
+    # Binary::apt::APT::Keep-Downloaded-Packages "false";
+    # Dir::Cache::pkgcache "";
+    # Dir::Cache::srcpkgcache "";
+    # EOF
+    # echo "[镜像瘦身] 已配置APT永久不生成缓存文件"
+
+    # --------------------------
+    # 3. /boot 分区无用文件清理
+    # --------------------------
+    echo -e "\n${YELLOW}[3/7] 清理/boot分区冗余文件${RESET}"
+    
+    rm -f /boot/System.map-*
+    rm -f /boot/config-*
+    echo "[镜像瘦身] 已删除内核符号表与编译配置文件"
+
+    # --------------------------
+    # 4. /usr/share 冗余资源清理
+    # --------------------------
+    echo -e "\n${YELLOW}[4/7] 清理/usr/share冗余资源${RESET}"
+    
+    # 删除文档、手册、帮助页
+    rm -rf /usr/share/doc /usr/share/man /usr/share/info /usr/share/common-licenses
+    echo "[镜像瘦身] 已删除系统文档与手册"
+
+    # 删除Perl语言库
+    rm -rf /usr/share/perl*
+    echo "[镜像瘦身] 已删除Perl语言资源"
+
+    # 删除多语言（仅保留英文）
+    if [ -d /usr/share/locale ]; then
+        find /usr/share/locale -type d ! -name "en" ! -path "/usr/share/locale" -exec rm -rf {} + 2>/dev/null
+    fi
+    rm -rf /usr/share/i18n
+    echo "[镜像瘦身] 已清理非英文本地化语言包"
+
+    # 删除桌面、图形、音效、字体等无关组件
+    rm -rf /usr/share/X11 /usr/share/bash-completion /usr/share/tcltk /usr/share/zsh
+    rm -rf /usr/share/figlet /usr/share/sounds /usr/share/icons /usr/share/pixmaps
+    rm -rf /usr/share/groff /usr/share/consolefonts /usr/share/console-setup
+    rm -rf /usr/share/alsa /usr/share/polkit-1 /usr/share/apport /usr/share/gcc
+    echo "[镜像瘦身] 已删除图形/音效/补全等非必要组件"
+
+    # --------------------------
+    # 5. /usr/lib 系统库冗余清理
+    # --------------------------
+    echo -e "\n${YELLOW}[5/7] 清理/usr/lib系统库冗余${RESET}"
+    
+    # 删除安装部署类工具（仅镜像制作使用，成品无用）
+    rm -rf /usr/lib/linux-image-* /usr/lib/linux-u-boot-*
+    rm -rf /usr/lib/armbian-install /usr/lib/armbian /usr/lib/armbian-config
+    rm -rf /usr/lib/nand-sata-install
+    echo "[镜像瘦身] 已删除系统安装部署工具"
+
+    # 删除Perl运行库
+    rm -rf /usr/lib/aarch64-linux-gnu/perl*
+    rm -f /usr/lib/aarch64-linux-gnu/libperl.so*
+    echo "[镜像瘦身] 已删除Perl运行时库"
+
+    # 删除多国字符编码库
+    rm -rf /usr/lib/aarch64-linux-gnu/gconv
+    echo "[镜像瘦身] 已删除gconv字符编码转换库"
+
+    # 删除日志、APT相关库
+    rm -rf /usr/lib/aarch64-linux-gnu/rsyslog
+    # rm -f /usr/lib/aarch64-linux-gnu/libapt-pkg.so*
+    # rm -rf /usr/lib/apt
+    echo "[镜像瘦身] 已删除rsyslog与APT底层库"
+
+    # 清理其他调试、文档工具
+    rm -rf /usr/lib/man-db /usr/lib/valgrind /usr/lib/tcltk /usr/lib/groff
+    rm -rf /usr/lib/dracut /usr/lib/initramfs-tools
+    # 清理非英文locale
+    if [ -d /usr/lib/locale ]; then
+        find /usr/lib/locale -type d ! -name "en" ! -path "/usr/lib/locale" -exec rm -rf {} + 2>/dev/null
+    fi
+    echo "[镜像瘦身] 已删除调试工具与冗余本地化文件"
+
+    # 删除无关服务组件
+    rm -rf /usr/lib/sasl2 /usr/lib/pam.d /usr/lib/console-setup /usr/lib/mime /usr/lib/lsb
+    rm -rf /usr/lib/pm-utils /usr/lib/rsyslog /usr/lib/sftp-server
+    echo "[镜像瘦身] 已删除非必要系统服务组件"
+
+    # --------------------------
+    # 6. 内核驱动模块精简
+    # --------------------------
+    echo -e "\n${YELLOW}[6/7] 精简内核驱动模块${RESET}"
+    
+    # 自动获取当前内核版本
+    local KERNEL_VER=$(ls /usr/lib/modules/ 2>/dev/null | head -1)
+    if [ -z "$KERNEL_VER" ]; then
+        echo "[镜像瘦身] ⚠️  未找到内核模块目录，跳过驱动精简"
+    else
+        local MODULES_KERNEL="/usr/lib/modules/${KERNEL_VER}/kernel"
+        echo "[镜像瘦身] 当前内核版本: ${KERNEL_VER}"
+
+        # 删除无用驱动大类（保留net/bluetooth/usb/gpio/i2c/spi/mmc/uart等核心）
+        if [ -d "${MODULES_KERNEL}/drivers" ]; then
+            rm -rf ${MODULES_KERNEL}/drivers/{accel,atm,bcma,cxkl,dax,edac,iommu,mailbox,mux,nfc,nvme,nvmem,of,pci,perf,pps,ptp,target,vhost,vfio,virt,virtio,w1,xen,staging,gnss,cdrom,gpu,video,media,leds}
+            echo "[镜像瘦身] 已删除虚拟化/多媒体/工业总线等无用驱动"
+        fi
+
+        # 删除无用文件系统（保留ext4/fat，适配SD卡/U盘）
+        if [ -d "${MODULES_KERNEL}/fs" ]; then
+            rm -rf ${MODULES_KERNEL}/fs/{9p,adfs,affs,afs,befs,bfs,btrfs,cachefiles,ceph,coda,cramfs,dlm,efivarfs,freevxfs,f2fs,hfs,hfsplus,hpfs,iso9660,jffs2,jfs,lockd,minix,nfs,nfs_common,nfsd,nilfs2,ntfs3,ocfs2,omfs,orangeefs,overlayfs,pstore,qnx4,qnx6,quota,romfs,smb,udf,ufs,xfs,zonefs,binfmt_misc.ko,fuse}
+            echo "[镜像瘦身] 已删除网络/特种文件系统模块"
+        fi
+
+        # 重新生成模块依赖（避免删完ko后加载报错）
+        depmod -a "${KERNEL_VER}" > /dev/null 2>&1
+        echo "[镜像瘦身] 已重建内核模块依赖索引"
+    fi
+
+    # --------------------------
+    # 7. 硬件固件精简（核心瘦身项）
+    # --------------------------
+    echo -e "\n${YELLOW}[7/7] 精简硬件固件库${RESET}"
+    
+    local FIRMWARE_DIR="/usr/lib/firmware"
+    if [ -d "$FIRMWARE_DIR" ]; then
+        # 【重点保留】你的硬件必需固件：AIC8800 + RTL8821CS + 蓝牙 + USB网卡 + RK平台
+        # 其余全量删除
+
+        # 删除高通超大基带固件（226M大头，完全无关）
+        rm -rf ${FIRMWARE_DIR}/qcom
+        echo "[镜像瘦身] 已删除高通基带固件"
+
+        # 删除其他品牌WiFi/蓝牙（不碰AIC8800、Realtek全系列）
+        rm -rf ${FIRMWARE_DIR}/{brcm,ath11k,ath10k,ath12k,mediatek,intel,ap6212,ap6275p,ap6210,cypress,ti-connectivity,qca,xr819,ssv6051,ssv6x5x,rt2870}
+        rm -rf ${FIRMWARE_DIR}/iwlwifi-*
+        echo "[镜像瘦身] 已删除博通/Intel/联发科等第三方WiFi固件"
+
+        # 删除视频、多媒体、电视机顶盒固件
+        rm -rf ${FIRMWARE_DIR}/{vpu,video,meson,novatek,s5p-mfc-v8.fw,v4l-coda960-*}
+        rm -rf ${FIRMWARE_DIR}/dvb-* ${FIRMWARE_DIR}/xc3028* ${FIRMWARE_DIR}/xc4000*
+        echo "[镜像瘦身] 已删除多媒体/电视相关固件"
+
+        # 删除其他ARM平台、杂项固件
+        rm -rf ${FIRMWARE_DIR}/{uwe5622,arm,imx,edid,cirrus,sdma,renesas_usb_fw.mem}
+        echo "[镜像瘦身] 已删除其他平台杂项固件"
+
+        # 删除无用配置文档与空占位文件
+        rm -rf ${FIRMWARE_DIR}/README.md ${FIRMWARE_DIR}/nvram_*.txt ${FIRMWARE_DIR}/bt_configure_*.ini
+        rm -f ${FIRMWARE_DIR}/wifi_2355b001_1ant.ini ${FIRMWARE_DIR}/wcnmodem.bin ${FIRMWARE_DIR}/mt76*
+        echo "[镜像瘦身] 已删除冗余配置与空文件"
+    fi
+
+    echo -e "\n${GREEN}[镜像瘦身] ==========================================${RESET}"
+    echo -e "${GREEN}[镜像瘦身] 系统精简优化执行完成！${RESET}"
+    echo -e "${GREEN}[镜像瘦身] ==========================================${RESET}\n"
+}
+
+
 Main() {
 	case $RELEASE in
 		noble)
@@ -116,6 +316,9 @@ Main() {
 			# # 标准交叉编译指令
 			# make -C ${KERNEL_PATH} M=$(pwd) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules
 			# =====================================================
+
+            # 调用镜像瘦身函数
+            image_slim_optimize
 			;;
 		stretch)
 			# your code here
