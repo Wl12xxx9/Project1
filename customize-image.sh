@@ -139,23 +139,23 @@ image_slim_optimize() {
     echo "[镜像瘦身] 已删除系统安装部署工具"
 
     # 删除Perl运行库
-    rm -rf /usr/lib/aarch64-linux-gnu/perl*
-    rm -f /usr/lib/aarch64-linux-gnu/libperl.so*
-    echo "[镜像瘦身] 已删除Perl运行时库"
+    # rm -rf /usr/lib/aarch64-linux-gnu/perl*
+    # rm -f /usr/lib/aarch64-linux-gnu/libperl.so*
+    # echo "[镜像瘦身] 已删除Perl运行时库"
 
     # 删除多国字符编码库
-    rm -rf /usr/lib/aarch64-linux-gnu/gconv
-    echo "[镜像瘦身] 已删除gconv字符编码转换库"
+    # rm -rf /usr/lib/aarch64-linux-gnu/gconv
+    # echo "[镜像瘦身] 已删除gconv字符编码转换库"
 
     # 删除日志、APT相关库
     rm -rf /usr/lib/aarch64-linux-gnu/rsyslog
     # rm -f /usr/lib/aarch64-linux-gnu/libapt-pkg.so*
     # rm -rf /usr/lib/apt
-    echo "[镜像瘦身] 已删除rsyslog与APT底层库"
+    # echo "[镜像瘦身] 已删除rsyslog与APT底层库"
 
     # 清理其他调试、文档工具
     rm -rf /usr/lib/man-db /usr/lib/valgrind /usr/lib/tcltk /usr/lib/groff
-    rm -rf /usr/lib/dracut /usr/lib/initramfs-tools
+    # rm -rf /usr/lib/dracut /usr/lib/initramfs-tools
     # 清理非英文locale
     if [ -d /usr/lib/locale ]; then
         find /usr/lib/locale -type d ! -name "en" ! -path "/usr/lib/locale" -exec rm -rf {} + 2>/dev/null
@@ -163,7 +163,8 @@ image_slim_optimize() {
     echo "[镜像瘦身] 已删除调试工具与冗余本地化文件"
 
     # 删除无关服务组件
-    rm -rf /usr/lib/sasl2 /usr/lib/pam.d /usr/lib/console-setup /usr/lib/mime /usr/lib/lsb
+    # rm -rf /usr/lib/sasl2 /usr/lib/pam.d /usr/lib/console-setup /usr/lib/mime /usr/lib/lsb
+	rm -rf /usr/lib/sasl2 /usr/lib/console-setup /usr/lib/mime /usr/lib/lsb
     rm -rf /usr/lib/pm-utils /usr/lib/rsyslog /usr/lib/sftp-server
     echo "[镜像瘦身] 已删除非必要系统服务组件"
 
@@ -182,8 +183,9 @@ image_slim_optimize() {
 
         # 删除无用驱动大类（保留net/bluetooth/usb/gpio/i2c/spi/mmc/uart等核心）
         if [ -d "${MODULES_KERNEL}/drivers" ]; then
-            rm -rf ${MODULES_KERNEL}/drivers/{accel,atm,bcma,cxkl,dax,edac,iommu,mailbox,mux,nfc,nvme,nvmem,of,pci,perf,pps,ptp,target,vhost,vfio,virt,virtio,w1,xen,staging,gnss,cdrom,gpu,video,media,leds}
-            echo "[镜像瘦身] 已删除虚拟化/多媒体/工业总线等无用驱动"
+            # rm -rf ${MODULES_KERNEL}/drivers/{accel,atm,bcma,cxkl,dax,edac,iommu,mailbox,mux,nfc,nvme,nvmem,of,pci,perf,pps,ptp,target,vhost,vfio,virt,virtio,w1,xen,staging,gnss,cdrom,gpu,video,media,leds}
+            rm -rf ${MODULES_KERNEL}/drivers/{accel,atm,bcma,cxkl,dax,edac,iommu,mailbox,mux,nfc,nvme,pci,perf,pps,ptp,target,vhost,vfio,virt,virtio,w1,xen,staging,gnss,cdrom,gpu,video,media}
+			echo "[镜像瘦身] 已删除虚拟化/多媒体/工业总线等无用驱动"
         fi
 
         # 删除无用文件系统（保留ext4/fat，适配SD卡/U盘）
