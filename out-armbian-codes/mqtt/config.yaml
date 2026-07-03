@@ -1,0 +1,24 @@
+mqtt:
+  broker: "4ry508ao2807.vicp.fun"
+  port: 34796
+  user: "rk3566"
+  pwd: "123"
+  keep_alive: 60
+tls:
+  ca_cert: "/root/mqtt-tls-test/ca.crt"
+  client_cert: "/root/mqtt-tls-test/client_rk3566_001.crt"
+  client_key: "/root/mqtt-tls-test/client_rk3566_001.key"
+  expire_warn_days: 30
+klipper:
+  moonraker_socket: "/home/klipper/printer_data/comms/moonraker.sock"
+  timeout: 3
+# 新增日志、持久化路径配置，统一托管，不再代码硬编码
+log:
+  log_file: "/var/log/printer/mqtt_service.log"
+  log_max_size: 10485760
+  log_backup: 5
+persist:
+  config_file: "/opt/printer/config.json"
+  breakpoint_file: "/opt/printer/breakpoint.json"
+device_id: "PRT_COREXY_20260702_001"
+protocol_version: "1.0.0"

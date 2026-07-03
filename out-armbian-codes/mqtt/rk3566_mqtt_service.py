@@ -1,5 +1,6 @@
 import paho.mqtt.client as mqtt
 import json
+import socket
 import time
 import threading
 import queue
@@ -9,6 +10,12 @@ import os
 import ssl
 from datetime import datetime
 from collections import deque
+from pydantic import BaseSettings, Field
+from functools import lru_cache
+import yaml
+import subprocess
+import base64
+
 
 # ==================================================
 # ========== 🔧 需自行配置的参数区域 START ==========
@@ -20,7 +27,7 @@ DEVICE_MODEL = "CoreXY Pro"
 PROTOCOL_VERSION = "1.0.0"
 MCU_FIRMWARE_VERSION = "1.0.0"
 APP_VERSION = "1.0.0"
-ARMBIAN_VERSION = "Armbian_24.05_RK3566"
+ARMBIAN_VERSION = "Armbian_26.05_RK3566"
 
 # 2. MQTT连接配置
 MQTT_BROKER = "4ry508ao2807.vicp.fun"
@@ -35,10 +42,15 @@ CLIENT_CERT_PATH = "/root/mqtt-tls-test/client_rk3566_001.crt"
 CLIENT_KEY_PATH = "/root/mqtt-tls-test/client_rk3566_001.key"
 CERT_EXPIRE_WARN_DAYS = 30  # 证书剩余天数小于该值触发预警
 
-# 4. STM32串口配置（需根据实际硬件接线修改）
-STM32_SERIAL_PORT = "/dev/ttyS0"
-STM32_BAUDRATE = 115200
-STM32_CMD_TIMEOUT = 2  # 指令响应超时时间，单位秒
+# 4. Klipper配置
+# Klipper Moonraker Unix Socket 路径（Armbian标准路径）
+MOONRAKER_SOCKET = "/home/klipper/printer_data/comms/moonraker.sock"
+# Klipper CAN总线STM32下位机唯一CAN UUID
+CAN_MCU_UUID = "2dc7a3ac3edd"
+# 芯片型号仅做日志打印用，不参与通信判断
+MCU_CHIP_TYPE = "stm32f407"
+# Klipper指令超时
+KLIPPER_TIMEOUT = 3
 
 # 5. 上报频率配置
 STATUS_REPORT_INTERVAL = 1  # 实时状态上报间隔，单位秒
@@ -102,22 +114,99 @@ STATE_TRANSITION_ALLOW = {
     PRINT_STATE["ERROR"]: ["idle"]
 }
 
+class MQTTSettings(BaseSettings):
+    broker: str
+    port: int
+    user: str
+    pwd: str
+    keep_alive: int = 60
+
+class TLSSettings(BaseSettings):
+    ca_cert: str
+    client_cert: str
+    client_key: str
+    expire_warn_days: int = 30
+
+class KlipperSettings(BaseSettings):
+    moonraker_socket: str
+    timeout: int = 3
+
+class LogSettings(BaseSettings):
+    log_file: str = "/var/log/printer/mqtt_service.log"
+    log_max_size: int = 10485760
+    log_backup: int = 5
+
+class PersistSettings(BaseSettings):
+    config_file: str = "/opt/printer/config.json"
+    breakpoint_file: str = "/opt/printer/breakpoint.json"
+
+class AppSettings(BaseSettings):
+    mqtt: MQTTSettings
+    tls: TLSSettings
+    klipper: KlipperSettings
+    log: LogSettings
+    persist: PersistSettings
+    device_id: str = "PRT_COREXY_20260702_001"
+    protocol_version: str = "1.0.0"
+
+@lru_cache()
+def get_settings():
+    with open("config.yaml", "r") as f:
+        yaml_config = yaml.safe_load(f)
+    # 环境变量替换
+    for key, value in yaml_config.items():
+        if isinstance(value, dict):
+            for k, v in value.items():
+                if isinstance(v, str) and v.startswith("${"):
+                    yaml_config[key][k] = os.getenv(v.strip("${}"), v)
+    return AppSettings(**yaml_config)
+
+settings = get_settings()
+
+# 使用
+DEVICE_ID = settings.device_id
+PROTOCOL_VERSION = settings.protocol_version
+CA_CERT_PATH = settings.tls.ca_cert
+CLIENT_CERT_PATH = settings.tls.client_cert
+CLIENT_KEY_PATH = settings.tls.client_key
+CERT_EXPIRE_WARN_DAYS = settings.tls.expire_warn_days
+MOONRAKER_SOCKET = settings.klipper.moonraker_socket
+KLIPPER_TIMEOUT = settings.klipper.timeout
+
+# AI摄像头配置
+RTSP_STREAM_URL = "rtsp://127.0.0.1:8554/stream"
+SNAPSHOT_SAVE_DIR = "/opt/printer/media/snapshots"
+HTTP_MEDIA_BASE = "http://{device_ip}:8080/media/snapshots"
 
 # ========== 日志系统初始化 ==========
 def init_logger():
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
     logger = logging.getLogger("printer_mqtt")
     logger.setLevel(logging.INFO)
-    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    
-    # 文件日志（轮转）
+    # 优化日志格式：添加进程ID、线程ID
+    formatter = logging.Formatter(
+        "%(asctime)s - %(process)d - %(threadName)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    # 按时间（每天）+ 大小（10MB）轮转
+    # from logging.handlers import TimedRotatingFileHandler
+    # file_handler = TimedRotatingFileHandler(
+    #     LOG_FILE,
+    #     when="D",  # 每天轮转
+    #     interval=1,
+    #     backupCount=7,  # 保留7天
+    #     encoding="utf-8"
+    # )
+    # 叠加大小限制
     file_handler = RotatingFileHandler(
-        LOG_FILE, maxBytes=LOG_MAX_SIZE, backupCount=LOG_BACKUP_COUNT, encoding="utf-8"
+        LOG_FILE,
+        maxBytes=10*1024*1024,
+        backupCount=5,
+        encoding="utf-8"
     )
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
-    
-    # 控制台输出（systemd可捕获）
+    # 控制台handler
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
@@ -126,61 +215,318 @@ def init_logger():
 logger = init_logger()
 
 
-# ========== STM32适配层（需根据你的串口协议补充实现） ==========
+# ========== STM32适配层（Moonraker API） ==========
 class STM32Adapter:
     """
-    RK3566与STM32F407的异构通信适配层
-    需根据你实际的串口协议格式，补充指令转换和数据解析逻辑
+    适配Klipper+Moonraker，USB-CAN桥接STM32F407
+    废弃串口读写，通过Moonraker Unix Socket交互Klipper
     """
     def __init__(self):
-        self.serial = None
-        self._init_serial()
+        self.socket_path = settings.klipper.moonraker_socket
+        self.sock = None
+        self.status_callback = None  # 状态变更回调
+        self._connect_moonraker()
+        self._subscribe_moonraker_events()  # 新增订阅事件
+        logger.info(f"Klipper Moonraker Socket 连接完成 | 芯片:{MCU_CHIP_TYPE} | CAN_UUID:{CAN_MCU_UUID}")
 
-    def _init_serial(self):
-        """初始化串口，实际使用时替换为真实pyserial代码"""
+    def _subscribe_moonraker_events(self):
+        """订阅Moonraker状态变更事件"""
+        subscribe_req = {
+            "jsonrpc": "2.0",
+            "method": "printer.objects.subscribe",
+            "params": {
+                "objects": {
+                    "toolhead": None,
+                    "extruder": None,
+                    "heater_bed": None,
+                    "fan": None,
+                    "print_stats": None  # 新增打印状态
+                }
+            },
+            "id": int(time.time()*1000)
+        }
         try:
-            # import serial  # 实际使用时取消注释，安装pyserial
-            # self.serial = serial.Serial(STM32_SERIAL_PORT, STM32_BAUDRATE, timeout=0.5)
-            logger.info(f"STM32串口初始化完成：{STM32_SERIAL_PORT} @ {STM32_BAUDRATE}")
+            self.sock.sendall((json.dumps(subscribe_req)+"\n").encode("utf-8"))
+            # 启动事件监听线程
+            threading.Thread(target=self._event_listener, daemon=True, name="moonraker_event").start()
         except Exception as e:
-            logger.error(f"STM32串口初始化失败：{e}")
+            logger.error(f"订阅Moonraker事件失败：{e}")
+
+    def _connect_moonraker(self):
+        """建立本地Unix Socket连接Moonraker"""
+        try:
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.connect(self.socket_path)
+        except Exception as e:
+            logger.error(f"Moonraker连接失败，请检查Moonraker是否运行: {e}")
+            self.sock = None
+
+    def _event_listener(self):
+        """监听Moonraker状态事件推送"""
+        reconnect_delay = 1
+        max_reconnect_delay = 10
+        while True:
+            try:
+                if self.sock is None:
+                    self._connect_moonraker()
+                    time.sleep(reconnect_delay)
+                    reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)  # 指数退避
+                    continue
+                recv_buf = self.sock.recv(4096).decode("utf-8")
+                if not recv_buf:
+                    continue
+                for line in recv_buf.split("\n"):
+                    if not line:
+                        continue
+                    resp = json.loads(line)
+                    if "method" in resp and resp["method"] == "notify_status":
+                        # 状态变更，触发回调
+                        if self.status_callback:
+                            self.status_callback(resp["params"]["status"])
+
+            except Exception as e:
+                logger.error(f"Moonraker事件监听异常：{e}")
+                self.sock.close()
+                self.sock = None
+                reconnect_delay = 1  # 重置延迟
+                time.sleep(1)
+
+    def _send_moonraker_rpc(self, rpc_method, params=None):
+        """标准Moonraker RPC请求封装"""
+        if self.sock is None:
+            self._connect_moonraker()
+            if self.sock is None:
+                return False, {}, ERROR_CODE["MCU_TIMEOUT"]
+        req = {
+            "jsonrpc": "2.0",
+            "method": rpc_method,
+            "params": params if params else {},
+            "id": int(time.time()*1000)
+        }
+        try:
+            self.sock.sendall((json.dumps(req)+"\n").encode("utf-8"))
+            recv_buf = self.sock.recv(4096).decode("utf-8")
+            resp = json.loads(recv_buf)
+            if "error" in resp:
+                logger.error(f"Moonraker RPC错误: {resp['error']}")
+                return False, {}, ERROR_CODE["MCU_TIMEOUT"]
+            return True, resp.get("result", {}), ERROR_CODE["SUCCESS"]
+        except Exception as e:
+            logger.error(f"Moonraker通信异常: {e}")
+            self.sock.close()
+            self.sock = None
+            return False, {}, ERROR_CODE["MCU_TIMEOUT"]
 
     def send_command(self, cmd_type, params):
         """
-        发送指令到STM32，等待响应
-        :param cmd_type: 指令类型（如set_temp、home、move）
-        :param params: 指令参数字典
-        :return: (success: bool, result: dict, error_code: int)
+        MQTT上层指令 → 转换为Klipper G-code/Moonraker指令
+        cmd_type：协议cmd_type (print_control/motion_control/param_set...)
+        params：指令入参
+        返回 (success, result_dict, error_code)
         """
-        # TODO: 🔧 需自行实现：将上层业务指令转换为串口协议帧，发送并等待响应
-        # 示例逻辑：
-        # 1. 组装串口帧：帧头 + 指令码 + 数据长度 + 参数 + CRC校验
-        # 2. 串口发送
-        # 3. 等待响应，超时返回MCU_TIMEOUT错误
-        time.sleep(0.1)  # 模拟通信延迟
-        logger.debug(f"转发指令到STM32：{cmd_type} {params}")
+        # 1. 温控设置 param_set
+        if cmd_type == "param_set":
+            cmds = []
+            if "nozzle_target" in params:
+                cmds.append(f"M104 S{params['nozzle_target']}")
+            if "bed_target" in params:
+                cmds.append(f"M140 S{params['bed_target']}")
+            if "fan_speed" in params:
+                cmds.append(f"M106 P0 S{int(params['fan_speed']*2.55)}")
+            gcode = "\n".join(cmds)
+            return self._send_moonraker_rpc("printer.gcode.script", {"script": gcode})
+
+        # 2. 运动控制 motion_control
+        elif cmd_type == "motion_control":
+            action = params.get("action")
+            if action == "home_all":
+                return self._send_moonraker_rpc("printer.gcode.script", {"script": "G28"})
+            elif action == "jog":
+                axis = params["axis"]
+                dist = params["distance"]
+                speed = params["speed"]
+                rel = "G91" if params.get("relative", True) else "G90"
+                gcode = f"{rel}\nG1 {axis}{dist} F{speed*60}"
+                return self._send_moonraker_rpc("printer.gcode.script", {"script": gcode})
+            elif action == "motors_off":
+                return self._send_moonraker_rpc("printer.gcode.script", {"script": "M84"})
+
+        # 3. 打印控制 print_control
+        elif cmd_type == "print_control":
+            action = params["action"]
+            if action == "start":
+                fname = params["file_name"]
+                return self._send_moonraker_rpc("printer.print.start", {"filename": fname})
+            elif action == "pause":
+                return self._send_moonraker_rpc("printer.print.pause", {})
+            elif action == "resume":
+                return self._send_moonraker_rpc("printer.print.resume", {})
+            elif action in ["stop", "cancel"]:
+                return self._send_moonraker_rpc("printer.print.cancel", {})
+
+        # 4. 系统校准 PID/调平
+        elif cmd_type == "system_config":
+            action = params["action"]
+            if action == "pid_tune":
+                target = params["target"]
+                temp = params["target_temp"]
+                heater = "extruder" if target == "extruder" else "heater_bed"
+                gcode = f"M303 E{heater} S{temp}"
+                return self._send_moonraker_rpc("printer.gcode.script", {"script": gcode})
+            elif action == "bed_leveling":
+                return self._send_moonraker_rpc("printer.gcode.script", {"script": "BED_MESH_CALIBRATE"})
+
+        elif cmd_type == "file_manage":
+            action = params.get("action")
+            if action == "list":
+                page = params.get("page", 1)
+                page_size = params.get("page_size", 20)
+                # 调用Moonraker获取gcodes目录文件列表
+                success, result, code = self._send_moonraker_rpc("server.files.list", {
+                    "root": "gcodes"
+                })
+                if not success:
+                    return False, {}, code
+                # 分页处理
+                files = result.get("files", [])
+                total = len(files)
+                start = (page - 1) * page_size
+                end = start + page_size
+                page_files = files[start:end]
+                # 映射协议字段
+                file_list = [{
+                    "file_name": f.get("filename", ""),
+                    "size": f.get("size", 0),
+                    "upload_time": f.get("modified", 0),
+                    "layer_count": 0,
+                    "print_time": f.get("print_time", 0)
+                } for f in page_files]
+
+                return True, {
+                    "total": total,
+                    "page": page,
+                    "page_size": page_size,
+                    "file_list": file_list
+                }, ERROR_CODE["SUCCESS"]
+
+            elif action == "delete":
+                file_name = params.get("file_name", "")
+                if not file_name:
+                    return False, {}, ERROR_CODE["PARAM_MISS"]
+                success, result, code = self._send_moonraker_rpc("server.files.delete", {
+                    "root": "gcodes",
+                    "filename": file_name
+                })
+                return success, result, code
+
+        elif cmd_type == "ai_camera_control":
+            action = params.get("action")
+            if action == "capture":
+                success, result = self._capture_snapshot()
+                return success, result, ERROR_CODE["SUCCESS"] if success else ERROR_CODE["SYSTEM_ERROR"]
+            elif action == "set_mode":
+                enable = params.get("enable", True)
+                mode = params.get("mode", "")
+                # 预留：启停AI检测进程，此处更新状态缓存
+                return True, {"enable": enable, "mode": mode}, ERROR_CODE["SUCCESS"]
+
+        # 5. AI、文件查询类直接本地处理，不进Klipper
         return True, {}, ERROR_CODE["SUCCESS"]
 
     def get_realtime_data(self):
         """
-        从STM32读取实时底层数据，聚合为上层状态格式
-        :return: 状态数据字典
+        从Moonraker读取Klipper实时状态 → 转换为MQTT协议规定status结构
+        返回聚合后的温度、坐标、电机状态字典
         """
-        # TODO: 🔧 需自行实现：读取STM32上报的温度、坐标、电机状态，聚合成协议格式
-        # 模拟数据，实际替换为串口读取解析
+        success, klipper_state, code = self._send_moonraker_rpc("printer.objects.query", {
+            "objects": {
+                "toolhead": ["position", "homed_axes", "velocity"],
+                "extruder": ["temperature", "target", "power"],
+                "heater_bed": ["temperature", "target"],
+                "fan": ["speed"]
+            }
+        })
+        if not success:
+            # 返回兜底默认数据
+            return {
+                "temperature": {"nozzle":{"current":25,"target":0,"heating":False},"bed":{"current":25,"target":0,"heating":False}},
+                "motion": {"position":{"x":0,"y":0,"z":0,"e":0},"current_velocity":0,"motors_enabled":False,"homed":{"x":False,"y":False,"z":False},"driver_status":{"x":"normal","y":"normal","z":"normal","e":"normal"}}
+            }
+        # 解析Klipper原生数据，映射协议字段
+        toolhead = klipper_state.get("toolhead", {})
+        extruder = klipper_state.get("extruder", {})
+        heater_bed = klipper_state.get("heater_bed", {})
+        fan = klipper_state.get("fan", {})
+        pos = toolhead.get("position", [0,0,0,0])
+        homed_str = toolhead.get("homed_axes", "")
+        homed = {
+            "x": "x" in homed_str,
+            "y": "y" in homed_str,
+            "z": "z" in homed_str
+        }
+        nozzle_heat = extruder.get("power", 0) > 0
+        bed_heat = heater_bed.get("power", 0) > 0
         return {
             "temperature": {
-                "nozzle": {"current": 205.2, "target": 200, "heating": True},
-                "bed": {"current": 60.1, "target": 60, "heating": False}
+                "nozzle": {
+                    "current": round(extruder.get("temperature", 25.0),1),
+                    "target": extruder.get("target", 0.0),
+                    "heating": nozzle_heat
+                },
+                "bed": {
+                    "current": round(heater_bed.get("temperature",25.0),1),
+                    "target": heater_bed.get("target",0.0),
+                    "heating": bed_heat
+                }
             },
             "motion": {
-                "position": {"x": 100.0, "y": 100.0, "z": 50.0, "e": 0.0},
-                "current_velocity": 50,
-                "motors_enabled": True,
-                "homed": {"x": True, "y": True, "z": True},
-                "driver_status": {"x": "normal", "y": "normal", "z": "normal", "e": "normal"}
+                "position": {"x":pos[0],"y":pos[1],"z":pos[2],"e":pos[3]},
+                "current_velocity": round(toolhead.get("velocity",0),1),
+                "motors_enabled": len(homed_str) > 0,
+                "homed": homed,
+                "driver_status": {"x":"normal","y":"normal","z":"normal","e":"normal"}
             }
         }
+
+    def _capture_snapshot(self):
+        """从RTSP流截取一帧图片，返回文件名、访问地址、缩略图"""
+        os.makedirs(SNAPSHOT_SAVE_DIR, exist_ok=True)
+        timestamp = int(time.time())
+        file_name = f"snap_{timestamp}.jpg"
+        save_path = os.path.join(SNAPSHOT_SAVE_DIR, file_name)
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-rtsp_transport", "tcp",
+            "-i", RTSP_STREAM_URL,
+            "-vframes", "1",
+            "-q:v", "2",
+            save_path
+        ]
+
+        try:
+            subprocess.run(cmd, timeout=5, capture_output=True, check=True)
+            if not os.path.exists(save_path):
+                return False, {}
+
+            # 生成缩略图base64（可选，按需启用）
+            with open(save_path, "rb") as f:
+                thumbnail = base64.b64encode(f.read()).decode("utf-8")
+
+            # 获取设备IP（替换占位符，实际可从网卡读取）
+            device_ip = "127.0.0.1"
+            img_url = HTTP_MEDIA_BASE.format(device_ip=device_ip) + "/" + file_name
+
+            return True, {
+                "img_file": file_name,
+                "img_url": img_url,
+                "thumbnail": thumbnail,
+                "capture_time": int(time.time()*1000)
+            }
+
+        except Exception as e:
+            logger.error(f"AI抓拍失败：{e}")
+            return False, {}
 
 
 # ========== 状态管理层 ==========
@@ -188,6 +534,7 @@ class StatusManager:
     def __init__(self, stm32_adapter):
         self.stm32 = stm32_adapter
         self.status_lock = threading.Lock()
+        self._start_system_monitor_thread()
         
         # 全量状态缓存（内存缓存，对应协议status结构）
         self.status_cache = {
@@ -221,7 +568,92 @@ class StatusManager:
         }
         
         self._load_persistent_data()
-        self._start_status_update_thread()
+        self.stm32.status_callback = self._on_klipper_status_update
+
+    def _on_klipper_status_update(self, klipper_state):
+        """Moonraker状态变更回调"""
+        try:
+            # 解析klipper_state，更新status_cache（逻辑同原get_realtime_data）
+            with self.status_lock:
+                print_stats = klipper_state.get("print_stats", {})
+                # 1. 更新温度/运动状态
+                toolhead = klipper_state.get("toolhead", {})
+                extruder = klipper_state.get("extruder", {})
+                heater_bed = klipper_state.get("heater_bed", {})
+                fan = klipper_state.get("fan", {})
+                
+                # 解析运动数据
+                pos = toolhead.get("position", [0,0,0,0])
+                homed_str = toolhead.get("homed_axes", "")
+                homed = {
+                    "x": "x" in homed_str,
+                    "y": "y" in homed_str,
+                    "z": "z" in homed_str
+                }
+                motion_data = {
+                    "position": {"x":pos[0],"y":pos[1],"z":pos[2],"e":pos[3]},
+                    "current_velocity": round(toolhead.get("velocity",0),1),
+                    "motors_enabled": len(homed_str) > 0,
+                    "homed": homed,
+                    "driver_status": {"x":"normal","y":"normal","z":"normal","e":"normal"}
+                }
+                
+                # 解析温度数据
+                nozzle_heat = extruder.get("power", 0) > 0
+                bed_heat = heater_bed.get("power", 0) > 0
+                temp_data = {
+                    "nozzle": {
+                        "current": round(extruder.get("temperature", 25.0),1),
+                        "target": extruder.get("target", 0.0),
+                        "heating": nozzle_heat
+                    },
+                    "bed": {
+                        "current": round(heater_bed.get("temperature",25.0),1),
+                        "target": heater_bed.get("target",0.0),
+                        "heating": bed_heat
+                    }
+                }
+                
+                self.status_cache["motion"] = motion_data
+                self.status_cache["temperature"] = temp_data
+                
+                # 2. 更新打印状态（新增）
+                # Klipper原生状态 → MQTT协议标准状态映射表
+                KLIPPER_STATE_MAP = {
+                    "standby": PRINT_STATE["IDLE"],
+                    "printing": PRINT_STATE["PRINTING"],
+                    "paused": PRINT_STATE["paused"],
+                    "complete": PRINT_STATE["COMPLETE"],
+                    "cancelled": PRINT_STATE["IDLE"],
+                    "error": PRINT_STATE["ERROR"]
+                }
+                # 提取原生打印状态
+                raw_print_state = print_stats.get("state", "standby")
+                # 映射为协议规定标准状态
+                self.status_cache["print_state"] = KLIPPER_STATE_MAP.get(raw_print_state, PRINT_STATE["IDLE"])
+
+                # 额外补充：加热阶段判断（区分idle和heating）
+                heater_nozzle = klipper.get("extruder", {})
+                heater_bed = klipper.get("heater_bed", {})
+                nozzle_target = heater_nozzle.get("target", 0)
+                bed_target = heater_bed.get("target", 0)
+                current_state = self.status_cache["print_state"]
+                # 空闲但有加热目标 → 协议状态改为heating
+                if current_state == PRINT_STATE["IDLE"] and (nozzle_target > 0 or bed_target > 0):
+                    self.status_cache["print_state"] = PRINT_STATE["HEATING"]
+                
+                # 3. 更新打印进度（新增）
+                self.status_cache["print_progress"] = {
+                    "current_file": print_stats.get("filename", ""),
+                    "print_duration": print_stats.get("print_duration", 0),
+                    "remain_time": print_stats.get("estimated_time", 0) - print_stats.get("print_duration", 0),
+                    "progress_percent": print_stats.get("progress", 0) * 100,
+                    "current_layer": 0,  # 需Klipper启用layer_display插件
+                    "total_layers": 0,
+                    "filament_used_mm": print_stats.get("filament_used", 0)
+                }
+        except Exception as e:
+            logger.error(f"状态更新回调异常：{e}")
 
     def _load_persistent_data(self):
         """加载持久化配置和断点数据"""
@@ -232,23 +664,6 @@ class StatusManager:
                     logger.info("持久化配置加载完成")
             except Exception as e:
                 logger.warning(f"配置文件加载失败：{e}")
-
-    def _start_status_update_thread(self):
-        """启动状态更新线程，定时从STM32拉取数据"""
-        def update_loop():
-            while True:
-                try:
-                    bottom_data = self.stm32.get_realtime_data()
-                    with self.status_lock:
-                        self.status_cache["motion"] = bottom_data["motion"]
-                        self.status_cache["temperature"] = bottom_data["temperature"]
-                        # TODO: 补充系统状态采集（CPU、内存、温度）
-                except Exception as e:
-                    logger.error(f"状态更新异常：{e}")
-                time.sleep(STATUS_REPORT_INTERVAL)
-        
-        threading.Thread(target=update_loop, daemon=True).start()
-        logger.info("状态更新线程启动")
 
     def get_full_status(self):
         """获取全量状态快照"""
@@ -287,12 +702,86 @@ class StatusManager:
         except Exception as e:
             logger.error(f"断点保存失败：{e}")
 
+    def _start_system_monitor_thread(self):
+        """启动系统状态采集线程"""
+        def monitor_loop():
+            while True:
+                try:
+                    sys_data = self._collect_system_status()
+                    with self.status_lock:
+                        self.status_cache["system_status"] = sys_data
+                except Exception as e:
+                    logger.error(f"系统状态采集异常：{e}")
+                time.sleep(2)  # 2秒采集一次
+
+        threading.Thread(target=monitor_loop, daemon=True, name="system_monitor").start()
+        logger.info("系统状态采集线程启动")
+
+    def _collect_system_status(self):
+        """
+        纯原生/proc/sysfs采集系统状态，无psutil依赖
+        返回 {cpu_usage, mem_usage, soc_temp, storage_usage}
+        """
+        # 1. 计算CPU使用率（两次/proc/stat采样差值）
+        def read_cpu_total():
+            with open("/proc/stat", "r") as f:
+                line = f.readline()
+            parts = list(map(int, line.split()[1:]))
+            total = sum(parts)
+            idle = parts[3] + parts[4]
+            return total, idle
+        t1_total, t1_idle = read_cpu_total()
+        time.sleep(0.5)
+        t2_total, t2_idle = read_cpu_total()
+        delta_total = t2_total - t1_total
+        delta_idle = t2_idle - t1_idle
+        cpu_usage = round((1 - delta_idle / delta_total) * 100, 1) if delta_total > 0 else 0.0
+
+        # 2. 内存使用率 /proc/meminfo
+        with open("/proc/meminfo", "r") as f:
+            mem_lines = f.readlines()
+        mem_data = {}
+        for line in mem_lines:
+            k, v = line.split(":")
+            mem_data[k.strip()] = int(v.strip().split()[0])
+        total_kb = mem_data["MemTotal"]
+        avail_kb = mem_data["MemAvailable"]
+        mem_usage = round((1 - avail_kb / total_kb) * 100, 1)
+
+        # 3. 根分区存储使用率（df / 原生读取）
+        statvfs = os.statvfs("/")
+        total_blocks = statvfs.f_blocks * statvfs.f_frsize
+        free_blocks = statvfs.f_bfree * statvfs.f_frsize
+        storage_usage = round((1 - free_blocks / total_blocks) * 100, 1) if total_blocks > 0 else 0.0
+
+        # 4. RK3566 SOC温度 /sys/class/thermal/thermal_zone0 毫摄氏度转℃
+        soc_temp = 0.0
+        thermal_path = "/sys/class/thermal/thermal_zone0/temp"
+        if os.path.exists(thermal_path):
+            try:
+                with open(thermal_path, "r") as f:
+                    temp_milli = int(f.read().strip())
+                    soc_temp = round(temp_milli / 1000, 1)
+            except Exception:
+                pass
+
+        return {
+            "cpu_usage": cpu_usage,
+            "mem_usage": mem_usage,
+            "soc_temp": soc_temp,
+            "storage_usage": storage_usage
+        }
 
 # ========== MQTT核心层 ==========
 class MQTTService:
     def __init__(self, status_manager, stm32_adapter):
         self.status_mgr = status_manager
         self.stm32 = stm32_adapter
+        self.cmd_queue = queue.PriorityQueue(maxsize=100)
+        self.cmd_timeout = 10  # 指令执行超时
+        self.fuse_trigger = False  # 熔断标记
+        self.fuse_count = 0  # 连续失败次数
+        self.fuse_threshold = 5  # 连续失败5次触发熔断
         self.client = None
         self.connected = False
         self.reconnect_delay = 1  # 重连初始间隔，指数退避
@@ -303,7 +792,7 @@ class MQTTService:
         self.cache_lock = threading.Lock()
         
         # 指令优先级队列
-        self.cmd_queue = queue.PriorityQueue()
+        # self.cmd_queue = queue.PriorityQueue()
         
         self._init_client()
         self._start_cmd_process_thread()
@@ -331,17 +820,25 @@ class MQTTService:
 
     def _init_client(self):
         """初始化MQTT客户端，配置TLS、遗嘱、回调"""
-        self.client = mqtt.Client(client_id=DEVICE_ID, callback_api_version=mqtt.CallbackAPIVersion.VERSION1)
+        # self.client = mqtt.Client(client_id=DEVICE_ID, callback_api_version=mqtt.CallbackAPIVersion.VERSION1)
+        self.client = mqtt.Client(
+            client_id=DEVICE_ID,
+            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,  # 最新API
+            protocol=mqtt.MQTTv311  # 建议先改用v3.1.1，兼容绝大多数broker
+        )
         self.client.username_pw_set(MQTT_USER, MQTT_PWD)
         
         # 双向TLS配置
-        self.client.tls_set(
-            ca_certs=CA_CERT_PATH,
-            certfile=CLIENT_CERT_PATH,
-            keyfile=CLIENT_KEY_PATH,
-            tls_version=ssl.PROTOCOL_TLSv1_2
-        )
-        self.client.tls_insecure_set(False)  # 强制校验服务端域名
+        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        context.load_verify_locations(CA_CERT_PATH)
+        context.load_cert_chain(certfile=CLIENT_CERT_PATH, keyfile=CLIENT_KEY_PATH)
+        # 启用TLSv1.3，禁用弱加密套件
+        # context.options |= ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1 | ssl.OP_NO_TLSv1_2
+        # 仅禁用 TLS1.0 和 1.1，保留1.2和1.3，保证兼容性
+        context.options |= ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
+        context.set_ciphers('ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384')
+        self.client.tls_set_context(context)
+        self.client.tls_insecure_set(False)  # 强制校验服务端证书
         
         # 遗嘱消息（设备异常离线自动上报）
         will_payload = self._build_event_msg(
@@ -431,46 +928,81 @@ class MQTTService:
             logger.error(f"❌ MQTT连接失败，错误码：{rc}")
 
     def _on_disconnect(self, client, userdata, rc):
-        """连接断开回调，指数退避重连"""
+        """连接断开回调，指数退避重连（不阻塞事件循环）"""
         self.connected = False
         logger.warning(f"MQTT连接断开，错误码：{rc}，{self.reconnect_delay}s后重连")
         
-        while not self.connected:
-            try:
-                time.sleep(self.reconnect_delay)
-                self.client.reconnect()
-                # 指数退避：1s → 2s → 4s → ... → 最大60s
-                self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
-            except Exception as e:
-                logger.error(f"重连失败：{e}，{self.reconnect_delay}s后重试")
+        # 启动单独线程执行重连，不阻塞事件循环
+        def reconnect_worker():
+            while not self.connected:
+                try:
+                    time.sleep(self.reconnect_delay)
+                    self.client.reconnect()
+                    # 指数退避
+                    self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
+                except Exception as e:
+                    logger.error(f"重连失败：{e}，{self.reconnect_delay}s后重试")
+        
+        threading.Thread(target=reconnect_worker, daemon=True, name="mqtt_reconnect").start()
 
     def _on_message(self, client, userdata, msg):
         """下行消息接收回调"""
         try:
+            # 外层统一捕获JSON解析、基础字段缺失异常
             payload = json.loads(msg.payload.decode())
             logger.debug(f"收到指令：{msg.topic} {payload}")
-            
-            # 基础字段校验
+
+            # 校验下行指令必填字段
             required_fields = ["request_id", "cmd_type", "data"]
             for field in required_fields:
                 if field not in payload:
                     self._send_error_response(
-                        payload.get("request_id", ""), 
+                        payload.get("request_id", ""),
                         payload.get("cmd_type", ""),
                         ERROR_CODE["PARAM_MISS"],
                         f"缺少必填字段：{field}"
                     )
                     return
-            
-            # 根据Topic判断指令优先级，入队
+
             cmd_type = payload["cmd_type"]
+            request_id = payload["request_id"]
+            # 计算优先级，只算一次
             priority = self._get_cmd_priority(cmd_type)
-            self.cmd_queue.put((priority, msg.topic, payload))
-            
+
+            # 熔断拦截：设备持续故障拒绝新指令
+            if self.fuse_trigger:
+                self._send_error_response(
+                    request_id, cmd_type,
+                    ERROR_CODE["DEVICE_BUSY"],
+                    "设备熔断保护中，暂不接收指令"
+                )
+                return
+
+            # 队列满拦截 + 单独捕获入队异常
+            if self.cmd_queue.full():
+                self._send_error_response(
+                    request_id, cmd_type,
+                    ERROR_CODE["DEVICE_BUSY"],
+                    "指令队列已满，请稍后重试"
+                )
+                logger.warning(f"指令队列已满，丢弃指令 request_id:{request_id}")
+                return
+
+            # 安全入队，单独捕获队列异常
+            try:
+                self.cmd_queue.put((priority, msg.topic, payload), block=False)
+            except queue.Full:
+                self._send_error_response(
+                    request_id, cmd_type,
+                    ERROR_CODE["DEVICE_BUSY"],
+                    "指令队列瞬时满载"
+                )
+                logger.warning(f"put队列临时满，丢弃 {request_id}")
+
         except json.JSONDecodeError:
-            logger.error("指令JSON格式错误")
+            logger.error("下行指令JSON格式非法，丢弃消息")
         except Exception as e:
-            logger.error(f"消息处理异常：{e}")
+            logger.error(f"消息整体处理异常：{str(e)}", exc_info=True)
 
     def _get_cmd_priority(self, cmd_type):
         """获取指令优先级"""
@@ -499,41 +1031,180 @@ class MQTTService:
         logger.info("指令处理线程启动")
 
     def _execute_command(self, topic, payload):
-        """执行具体指令，分发给STM32或本地处理"""
+        """外层封装：负责超时熔断，调用真实执行逻辑"""
         request_id = payload["request_id"]
         cmd_type = payload["cmd_type"]
         data = payload["data"]
-        
-        # 1. 查询类指令：直接返回缓存，不访问STM32
+
+        try:
+            # 启动执行线程，限时等待
+            work_thread = threading.Thread(
+                target=self._do_execute,
+                args=(request_id, cmd_type, data),
+                daemon=True
+            )
+            work_thread.start()
+            work_thread.join(timeout=self.cmd_timeout)
+
+            if work_thread.is_alive():
+                raise TimeoutError("指令执行超时")
+
+        except TimeoutError:
+            self._send_error_response(request_id, cmd_type, ERROR_CODE["MCU_TIMEOUT"], "指令执行超时")
+            self.fuse_count += 1
+            # 连续失败达阈值，触发熔断
+            if self.fuse_count >= self.fuse_threshold and not self.fuse_trigger:
+                self.fuse_trigger = True
+                threading.Timer(5, self._reset_fuse).start()
+                logger.warning("连续执行失败，触发设备熔断保护")
+
+        except Exception as e:
+            self._send_error_response(request_id, cmd_type, ERROR_CODE["SYSTEM_ERROR"], str(e))
+            self.fuse_count += 1
+            if self.fuse_count >= self.fuse_threshold and not self.fuse_trigger:
+                self.fuse_trigger = True
+                threading.Timer(5, self._reset_fuse).start()
+        else:
+            self.fuse_count = 0  # 执行成功，重置熔断计数
+
+    def _do_execute(self, request_id, cmd_type, data):
+        """真实指令处理：查询校验、硬件调用、状态更新、返回响应"""
+        # 1. 查询类指令：直接返回缓存，不访问硬件
         if cmd_type == "common_query":
             query_type = data.get("query_type", "")
             if query_type == "full_status":
                 resp_data = self.status_mgr.get_full_status()
                 self._send_success_response(request_id, cmd_type, resp_data)
+            elif query_type == "version":
+                resp_data = {
+                    "protocol_version": PROTOCOL_VERSION,
+                    "app_version": APP_VERSION,
+                    "mcu_firmware_version": MCU_FIRMWARE_VERSION,
+                    "armbian_version": ARMBIAN_VERSION
+                }
+                self._send_success_response(request_id, cmd_type, resp_data)
+            elif query_type == "config":
+                resp_data = self._get_device_config()
+                self._send_success_response(request_id, cmd_type, resp_data)
+            else:
+                self._send_error_response(request_id, cmd_type, ERROR_CODE["PARAM_INVALID"], "未知查询类型")
             return
-        
-        # 2. 状态前置校验（非查询类指令都校验）
+
+        # 2. 状态前置校验
         if not self._check_cmd_state_allowed(cmd_type, data):
             self._send_error_response(request_id, cmd_type, ERROR_CODE["STATE_NOT_ALLOW"], "当前状态不允许该操作")
             return
-        
-        # 3. 分发到STM32执行
+
+        # 3. 分发到STM32/Klipper执行
         success, result, err_code = self.stm32.send_command(cmd_type, data)
         if not success:
-            self._send_error_response(request_id, cmd_type, err_code, "STM32执行失败")
+            self._send_error_response(request_id, cmd_type, err_code, "硬件执行失败")
             return
-        
-        # 4. 执行成功，更新状态，返回响应
-        if cmd_type == "print_control":
-            action = data["action"]
-            if action == "start":
-                self.status_mgr.set_print_state(PRINT_STATE["HEATING"])
-                self.publish_event("info", "print_start", 1001, {
-                    "file_name": data.get("file_name", ""),
-                    "estimate_time": 3600
-                })
-        
+
+        # 4. 打印类指令：状态变更 + 事件推送
+        if cmd_type == "print_control" and data.get("action") == "start":
+            self.status_mgr.set_print_state(PRINT_STATE["HEATING"])
+            self.publish_event("info", "print_start", 1001, {
+                "file_name": data.get("file_name", ""),
+                "estimate_time": 3600
+            })
+
+        if cmd_type == "ai_camera_control" and data.get("action") == "set_mode":
+            with self.status_mgr.status_lock:
+                self.status_mgr.status_cache["ai_camera"]["enabled"] = data.get("enable", True)
+                self.status_mgr.status_cache["ai_camera"]["current_mode"] = data.get("mode", "")
+                
+        # 5. 返回成功响应
         self._send_success_response(request_id, cmd_type, result)
+
+    def _get_device_config(self):
+        """生成完整设备配置结构体，对齐协议文档"""
+        return {
+            "device_base": {
+                "model": DEVICE_MODEL,
+                "serial_no": DEVICE_ID,
+                "production_date": "2026-07-02",
+                "production_index": 1,
+                "mcu_uuid": CAN_MCU_UUID,
+                "mcu_restart_method": "command"
+            },
+            "motion_config": {
+                "axis_count": 4,
+                "axis_list": ["x", "y", "z", "e"],
+                "max_speed": {"x": 300, "y": 300, "z": 20, "e": 50},
+                "max_accel": {"x": 3000, "y": 3000, "z": 500, "e": 1000},
+                "travel_range": {"x": 220, "y": 220, "z": 250},
+                "homing_order": ["z", "x", "y"],
+                "motor_type": "stepper_tmc2209"
+            },
+            "extruder_config": {
+                "nozzle_count": 1,
+                "nozzle_diameter": 0.4,
+                "max_temp": 260,
+                "min_temp": 0,
+                "pid_support": True,
+                "filament_diameter": 1.75
+            },
+            "bed_config": {
+                "support": True,
+                "max_temp": 110,
+                "min_temp": 0,
+                "size": {"x": 220, "y": 220},
+                "pid_support": True,
+                "leveling_support": True
+            },
+            "fan_config": {
+                "part_cooling_fan": True,
+                "nozzle_cooling_fan": True,
+                "fan_count": 2,
+                "speed_range": [0, 100]
+            },
+            "ai_camera_config": {
+                "support": True,
+                "model": "USB-1080P-HD",
+                "support_modes": ["first_layer_detect", "warpage_detect", "full_process_monitor"],
+                "rtsp_url": f"rtsp://{{device_ip}}:8554/stream",
+                "http_media_base": f"http://{{device_ip}}:8080/media",
+                "resolution": "1920x1080",
+                "encode_codec": "h264",
+                "stream_fps": 15,
+                "thumbnail_size": "320x240",
+                "media_expire_hour": 72
+            },
+            "system_version": {
+                "armbian_version": ARMBIAN_VERSION,
+                "mcu_firmware_version": MCU_FIRMWARE_VERSION,
+                "app_firmware_version": APP_VERSION,
+                "protocol_version": PROTOCOL_VERSION
+            }
+        }
+
+    def _publish_device_info(self):
+        """发布设备基础信息（保留消息）"""
+        info_msg = self._build_common_header("device_info")
+        info_msg["data"] = {
+            "device_id": DEVICE_ID,
+            "device_model": DEVICE_MODEL,
+            "protocol_version": PROTOCOL_VERSION,
+            "mcu_firmware_version": MCU_FIRMWARE_VERSION,
+            "app_version": APP_VERSION,
+            "armbian_version": ARMBIAN_VERSION,
+            "mcu_chip_type": MCU_CHIP_TYPE,
+            "can_mcu_uuid": CAN_MCU_UUID
+        }
+        self.client.publish(
+            topic=f"device/{DEVICE_ID}/info",
+            payload=json.dumps(info_msg),
+            qos=1,
+            retain=True
+        )
+        logger.info("设备基础信息已发布")
+
+    def _reset_fuse(self):
+        """重置熔断状态，仅做状态重置，无业务逻辑"""
+        self.fuse_trigger = False
+        self.fuse_count = 0
+        logger.info("设备熔断状态已重置，恢复指令接收")
 
     def _check_cmd_state_allowed(self, cmd_type, data):
         """指令状态前置校验"""
@@ -578,28 +1249,6 @@ class MQTTService:
         """发布事件（触发式，QoS=1）"""
         event_msg = self._build_event_msg(level, event_type, event_code, event_data)
         self.publish(f"device/{DEVICE_ID}/event", event_msg, qos=1)
-
-    def _publish_device_info(self):
-        """发布设备基础信息（保留消息，QoS=0）"""
-        info_msg = self._build_common_header("info")
-        info_msg["data"] = {
-            "device_base": {
-                "model": DEVICE_MODEL,
-                "serial_no": DEVICE_ID,
-                "production_date": "2026-07-02",
-                "production_index": 1,
-                "mcu_uuid": "2dc7a3ac3edd",
-                "mcu_restart_method": "command"
-            },
-            "system_version": {
-                "armbian_version": ARMBIAN_VERSION,
-                "mcu_firmware_version": MCU_FIRMWARE_VERSION,
-                "app_firmware_version": APP_VERSION
-            }
-            # TODO: 补充完整的motion_config、extruder_config等硬件配置
-        }
-        self.publish(f"device/{DEVICE_ID}/info", info_msg, qos=0, retain=True)
-        logger.info("设备基础信息保留消息已发布")
 
     def publish(self, topic, payload, qos=0, retain=False):
         """统一发布接口，离线时自动缓存"""
@@ -648,17 +1297,20 @@ class MQTTService:
             return False
 
     def start(self):
-        """启动服务"""
+        """启动服务，指数退避重试初始连接"""
         logger.info("MQTT服务启动中...")
+        reconnect_delay = 1
+        max_reconnect_delay = 60
+
         while not self.connected:
             try:
                 self.client.connect(MQTT_BROKER, MQTT_PORT, KEEP_ALIVE)
                 break
             except Exception as e:
-                logger.error(f"初始连接失败：{e}，{self.reconnect_delay}s后重试")
-                time.sleep(self.reconnect_delay)
-                self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
-        
+                logger.error(f"初始连接失败：{e}，{reconnect_delay}s后重试")
+                time.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
+
         self.client.loop_start()
 
 
