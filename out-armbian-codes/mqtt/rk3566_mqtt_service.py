@@ -105,7 +105,9 @@ ERROR_CODE = {
     "DEVICE_BUSY": 2005,
     "FILE_NOT_EXIST": 3001,
     "MCU_TIMEOUT": 4002,
-    "SYSTEM_ERROR": 5000
+    "SYSTEM_ERROR": 5000,
+    "RTSP_STREAM_ERROR":6000,
+    "AI_DETECT_ABNORMAL":6001
 }
 
 # 状态转移允许规则（状态前置校验依据）
@@ -233,7 +235,8 @@ class STM32Adapter:
     1. sub_sock：永久长连接，仅用于printer.objects.subscribe接收notify状态
     2. RPC每次新建独立unix socket短连接，无订阅推送干扰
     """
-    def __init__(self):
+    def __init__(self, status_mgr):
+        self.status_mgr = status_mgr
         self.socket_path = settings.klipper.moonraker_socket
         logger.info(f"当前加载的Moonraker Socket路径：{self.socket_path}")
         self.sub_sock = None       # 订阅专用长连接（只收notify）
@@ -524,7 +527,8 @@ class STM32Adapter:
             elif action == "set_mode":
                 enable = params.get("enable", True)
                 mode = params.get("mode", "")
-                # 预留：启停AI检测进程，此处更新状态缓存
+                # 调用StatusManager切换AI模式
+                self.status_mgr.set_ai_mode(enable, mode)
                 return True, {"enable": enable, "mode": mode}, ERROR_CODE["SUCCESS"]
         # 5. AI、文件查询类直接本地处理，不进Klipper
         return True, {}, ERROR_CODE["SUCCESS"]
@@ -584,43 +588,95 @@ class STM32Adapter:
         }
 
     def _capture_snapshot(self):
-        """从RTSP流截取一帧图片，返回文件名、访问地址、缩略图"""
-        os.makedirs(SNAPSHOT_SAVE_DIR, exist_ok)
-        timestamp = int(time.time())
+        """从RTSP流截取一帧图片，返回文件名、访问地址、base64缩略图"""
+        import shutil
+        if shutil.which("ffmpeg") is None:
+            logger.error("未安装ffmpeg，抓拍功能失效")
+            with self.status_mgr.status_lock:
+                self.status_mgr.status_cache["ai_camera"]["abnormal_type"] = "ffmpeg_missing"
+            return False, {"err_msg":"ffmpeg not found"}
+        # 检测rtsp端口是否监听
+        import socket
+        sock_test = socket.socket()
+        sock_test.settimeout(1)
+        try:
+            sock_test.connect(("127.0.0.1", 8554))
+            sock_test.close()
+        except:
+            logger.error("MediaMTX RTSP服务未启动，无法抓拍")
+            return False, {"err_msg":"rtsp服务未运行"}
+        os.makedirs(SNAPSHOT_SAVE_DIR, exist_ok=True)
+        # 自动清理72小时前截图，防止磁盘占满
+        def clean_expire_snap():
+            import glob
+            files = glob.glob(os.path.join(SNAPSHOT_SAVE_DIR, "snap_*.jpg"))
+            now = time.time()
+            for f in files:
+                if now - os.path.getctime(f) > 72 * 3600:
+                    os.remove(f)
+        try:
+            clean_expire_snap()
+        except Exception as e:
+            logger.warning(f"清理过期截图失败：{e}")
+
+        timestamp = int(time.time()*1000)
         file_name = f"snap_{timestamp}.jpg"
         save_path = os.path.join(SNAPSHOT_SAVE_DIR, file_name)
+        # ffmpeg抓拍命令，TCP传输降低丢帧
         cmd = [
             "ffmpeg", "-y",
-            "-rtsp_transport", "tcp",
+            "-rtsp_transport", "tcp", "-flags", "low_delay",
             "-i", RTSP_STREAM_URL,
-            "-vframes", "1",
-            "-q:v", "2",
+            "-vframes", "1", "-q:v", "3", "-t", "3",
             save_path
         ]
         try:
-            subprocess.run(cmd, timeout=5, capture_output=True, check=True)
+            # 执行抓拍，超时3秒
+            subprocess.run(cmd, timeout=3, capture_output=True, check=True)
             if not os.path.exists(save_path):
+                logger.error("抓拍生成文件不存在")
                 return False, {}
-            # 生成缩略图base64
+            # 读取图片base64缩略图
             with open(save_path, "rb") as f:
-                thumbnail = base64.b64encode(f.read()).decode("utf-8")
-            device_ip = "127.0.0.1"
-            img_url = HTTP_MEDIA_BASE.format(device_ip) + "/" + file_name
+                raw = f.read()
+                thumbnail = base64.b64encode(raw).decode("utf-8")
+            # 获取本机局域网IP，替换127.0.0.1
+            def get_local_ip():
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    s.connect(("8.8.8.8", 80))
+                    return s.getsockname()[0]
+                except Exception:
+                    return "127.0.0.1"
+                finally:
+                    s.close()
+            dev_ip = get_local_ip()
+            img_url = HTTP_MEDIA_BASE.format(device_ip=dev_ip) + "/" + file_name
             return True, {
                 "img_file": file_name,
                 "img_url": img_url,
                 "thumbnail": thumbnail,
-                "capture_time": int(time.time()*1000)
+                "capture_time": timestamp
             }
+        except subprocess.TimeoutExpired:
+            logger.error("ffmpeg抓拍超时，RTSP流异常")
+            # 新增异常标记
+            with self.status_mgr.status_lock:
+                self.status_mgr.status_cache["ai_camera"]["abnormal_type"] = "camera_disconnect"
+            return False, {"err_msg": "rtsp stream timeout"}
         except Exception as e:
-            logger.error(f"AI抓拍失败：{e}")
-            return False, {}
+            logger.error(f"AI抓拍异常：{str(e)}")
+            # 新增异常标记
+            with self.status_mgr.status_lock:
+                self.status_mgr.status_cache["ai_camera"]["abnormal_type"] = "camera_disconnect"
+            return False, {"err_msg": str(e)}
 
 
 # ========== 状态管理层 ==========
 class StatusManager:
-    def __init__(self, stm32_adapter):
+    def __init__(self, stm32_adapter, mqtt_srv):
         self.stm32 = stm32_adapter
+        self.mqtt_service = mqtt_srv  # 保存MQTT实例
         self.status_lock = threading.Lock()
         self._start_system_monitor_thread()
         
@@ -644,7 +700,10 @@ class StatusManager:
                 "current_mode": None,
                 "last_detect_result": "normal",
                 "confidence": 0.0,
-                "abnormal_type": None
+                "abnormal_type": None,
+                "detect_running": False,
+                "last_snap_time": 0,
+                "ai_thread_exit": False
             },
             "system_status": {
                 "cpu_usage": 0,
@@ -656,7 +715,7 @@ class StatusManager:
         }
         
         self._load_persistent_data()
-        self.stm32.status_callback = self._on_klipper_status_update
+        # self.stm32.status_callback = self._on_klipper_status_update
 
     def _on_klipper_status_update(self, klipper_state):
         """Moonraker状态变更回调"""
@@ -859,6 +918,107 @@ class StatusManager:
             "soc_temp": soc_temp,
             "storage_usage": storage_usage
         }
+
+    # def set_ai_mode(self, enable: bool, mode: str):
+    #     """切换AI检测模式，启停后台检测线程"""
+    #     with self.status_lock:
+    #         old_enable = self.status_cache["ai_camera"]["enabled"]
+    #         old_mode = self.status_cache["ai_camera"]["current_mode"]
+    #         self.status_cache["ai_camera"]["enabled"] = enable
+    #         self.status_cache["ai_camera"]["current_mode"] = mode
+            
+    #         # ===== 新增：关闭AI时设置线程退出标记 =====
+    #         if not enable:
+    #             self.status_cache["ai_camera"]["ai_thread_exit"] = True
+            
+    #         # 开关或模式变更，重启检测线程
+    #         if old_enable != enable or old_mode != mode:
+    #             if enable:
+    #                 self._start_ai_detect_thread()
+    #             else:
+    #                 self.status_cache["ai_camera"]["detect_running"] = False
+    #     logger.info(f"AI摄像头模式切换 enable={enable}, mode={mode}")
+    def set_ai_mode(self, enable: bool, mode: str):
+        """切换AI检测模式，启停后台检测线程"""
+        # 仅读写状态缓存，快速释放锁，不在线程创建逻辑内持有锁
+        with self.status_lock:
+            old_enable = self.status_cache["ai_camera"]["enabled"]
+            old_mode = self.status_cache["ai_camera"]["current_mode"]
+            self.status_cache["ai_camera"]["enabled"] = enable
+            self.status_cache["ai_camera"]["current_mode"] = mode
+            if not enable:
+                self.status_cache["ai_camera"]["ai_thread_exit"] = True
+        # 锁释放后，再执行线程启停（避免锁长期占用导致指令超时）
+        if old_enable != enable or old_mode != mode:
+            if enable:
+                self._start_ai_detect_thread()
+            else:
+                with self.status_lock:
+                    self.status_cache["ai_camera"]["detect_running"] = False 
+        logger.info(f"AI摄像头模式切换 enable={enable}, mode={mode}")
+        
+    def _start_ai_detect_thread(self):
+        """AI定时图像检测后台线程，打印状态为PRINTING时自动抓拍分析"""
+        # 增加判断，已运行直接返回
+        with self.status_lock:
+            if self.status_cache["ai_camera"]["detect_running"]:
+                logger.info("AI检测线程已存在，无需重复创建")
+                return
+        def ai_loop():
+            detect_interval = 5  # 5秒检测一次
+            while True:
+                # ===== 新增：判断线程退出标记 =====
+                with self.status_lock:
+                    if self.status_cache["ai_camera"]["ai_thread_exit"]:
+                        logger.info("AI检测线程收到关闭信号，退出")
+                        self.status_cache["ai_camera"]["detect_running"] = False
+                        self.status_cache["ai_camera"]["ai_thread_exit"] = False
+                        break
+                
+                with self.status_lock:
+                    ai_enable = self.status_cache["ai_camera"]["enabled"]
+                    run_flag = self.status_cache["ai_camera"]["detect_running"]
+                    print_state = self.status_cache["print_state"]
+                if not ai_enable or not run_flag or print_state != PRINT_STATE["PRINTING"]:
+                    time.sleep(1)
+                    continue
+                # 调用抓拍接口
+                success, snap_info = self.stm32._capture_snapshot()
+                if not success:
+                    logger.warning("AI自动抓拍失败，跳过本轮检测")
+                    time.sleep(detect_interval)
+                    continue
+                # ======================
+                # 此处预留AI图像推理接口（后续接入opencv/YOLO模型）
+                # 伪代码示例：
+                # result, conf, abnormal = ai_model_infer(snap_info["img_file"])
+                result = "normal"
+                conf = 0.92
+                abnormal = None
+                # ======================
+                with self.status_lock:
+                    self.status_cache["ai_camera"]["last_detect_result"] = result
+                    self.status_cache["ai_camera"]["confidence"] = conf
+                    self.status_cache["ai_camera"]["abnormal_type"] = abnormal
+                    self.status_cache["ai_camera"]["last_snap_time"] = snap_info["capture_time"]
+                # 检测到异常，上报EVENT告警
+                if result != "normal":
+                    self.mqtt_service.publish_event(
+                        level="warn",
+                        event_type="ai_detect_abnormal",
+                        event_code=6001,
+                        event_data={
+                            "abnormal_type": abnormal,
+                            "confidence": conf,
+                            "snap_url": snap_info["img_url"]
+                        }
+                    )
+                time.sleep(detect_interval)
+        # 启动守护线程
+        t = threading.Thread(target=ai_loop, daemon=True, name="ai_detect_bg")
+        t.start()
+        with self.status_lock:
+            self.status_cache["ai_camera"]["detect_running"] = True
 
 # ========== MQTT核心层 ==========
 class MQTTService:
@@ -1233,9 +1393,17 @@ class MQTTService:
             })
 
         if cmd_type == "ai_camera_control" and data.get("action") == "set_mode":
-            with self.status_mgr.status_lock:
-                self.status_mgr.status_cache["ai_camera"]["enabled"] = data.get("enable", True)
-                self.status_mgr.status_cache["ai_camera"]["current_mode"] = data.get("mode", "")
+            enable = data.get("enable")
+            mode = data.get("mode")
+            self.publish_event(
+                level="info",
+                event_type="ai_mode_switch",
+                event_code=6000,
+                event_data={"enable": enable, "mode": mode}
+            )
+            # with self.status_mgr.status_lock:
+            #     self.status_mgr.status_cache["ai_camera"]["enabled"] = data.get("enable", True)
+            #     self.status_mgr.status_cache["ai_camera"]["current_mode"] = data.get("mode", "")
                 
         # 5. 返回成功响应
         logger.info(f"【指令执行完成，准备回复PC】request_id={request_id}")
@@ -1456,9 +1624,17 @@ if __name__ == "__main__":
     logger.info("="*50)
     
     # 初始化各模块
-    stm32_adapter = STM32Adapter()
-    status_manager = StatusManager(stm32_adapter)
+    # 1. 先空实例化，不传入stm32
+    status_manager = StatusManager(None, None)
+    # 2. 创建STM32适配器，传入status_manager
+    stm32_adapter = STM32Adapter(status_manager)
+    # 3. 双向绑定对象
+    status_manager.stm32 = stm32_adapter
+    # 4. 现在stm32不是None，再绑定回调（关键修复）
+    status_manager.stm32.status_callback = status_manager._on_klipper_status_update
+    # 5. 创建MQTT服务，双向绑定
     mqtt_service = MQTTService(status_manager, stm32_adapter)
+    status_manager.mqtt_service = mqtt_service
     
     # 启动服务
     mqtt_service.start()

@@ -364,6 +364,7 @@ def console_mode():
     print("  1. 查询全量状态    2. 设置温度    3. 全轴归零")
     print("  4. 开始打印        5. 暂停打印    6. 恢复打印")
     print("  7. 停止打印        8. 获取文件列表 9. 运行全量自动测试")
+    print("  10. AI开启检测模式  11.AI手动抓拍")
     print("  0. 退出程序")
     print("="*60)
 
@@ -416,6 +417,13 @@ def console_mode():
                 print(json.dumps(resp, indent=2, ensure_ascii=False) if ok else "超时")
             elif cmd == "9":
                 auto_test_all()
+            elif cmd == "10":
+                # 开启首层检测
+                ok, resp = PrinterCommands.ai_set_mode(enable=True, mode="first_layer_detect")
+                print("成功" if ok and resp["data"]["result"]==0 else "失败", resp)
+            elif cmd == "11":
+                ok, resp = PrinterCommands.ai_capture()
+                print(json.dumps(resp, indent=2, ensure_ascii=False) if ok else "抓拍超时")
             else:
                 print("无效指令")
         except Exception as e:
