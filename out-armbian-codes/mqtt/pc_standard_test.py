@@ -24,16 +24,19 @@ CLIENT_CERT_PATH = r"E:\OpenSSL-Win64\bin\client_admin.crt"
 CLIENT_KEY_PATH = r"E:\OpenSSL-Win64\bin\client_admin.key"
 
 # 测试配置
-CMD_TIMEOUT = 5  # 指令响应超时时间，单位秒
+CMD_TIMEOUT = 15  # 指令响应超时时间，单位秒
 LOG_FILE = "./mqtt_test.log"
 # ==================================================
 # ========== 🔧 需自行配置的参数区域 END ==========
 # ==================================================
 
 # ========== 全局变量 ==========
+import queue  # 顶部已有import，不用重复加
 response_map = {}  # request_id -> 响应结果，用于同步等待
 response_cond = threading.Condition() 
 client = None
+# 新增：状态消息异步队列，解耦on_message阻塞
+status_msg_queue = queue.Queue(maxsize=200)
 
 # ========== 日志初始化 ==========
 def init_logger():
@@ -74,7 +77,7 @@ def on_connect(client, userdata, flags, rc):
         # 订阅所有上行Topic
         topics = [
             (f"device/{DEVICE_ID}/info", 0),
-            (f"device/{DEVICE_ID}/status", 0),
+            (f"device/{DEVICE_ID}/status", 1),
             (f"device/{DEVICE_ID}/event", 1),
             (f"device/{DEVICE_ID}/response", 1)
         ]
@@ -83,42 +86,86 @@ def on_connect(client, userdata, flags, rc):
     else:
         logger.error(f"❌ 连接失败，错误码：{rc}")
 
+# ========== MQTT回调函数 ==========
 def on_message(client, userdata, msg):
     try:
         payload = json.loads(msg.payload.decode())
         topic = msg.topic
-
         # 设备基础信息（保留消息）
         if topic.endswith("/info"):
             logger.info("\n📥 【设备基础信息】收到保留消息")
             logger.info(f"  内容：{json.dumps(payload, indent=2, ensure_ascii=False)}")
         
-        # 实时状态上报
+        # 实时状态上报（已修复多层Key缺失报错）
         elif topic.endswith("/status"):
-            print_state = payload["data"].get("print_state", "unknown")
-            temp = payload["data"]["temperature"]["nozzle"]["current"]
-            progress = payload["data"]["print_progress"]["progress_percent"]
-            logger.debug(f"📥 【实时状态】状态:{print_state} | 喷嘴:{temp}℃ | 进度:{progress}%")
+            # 直接丢队列，回调立刻退出，不阻塞MQTT网络循环
+            try:
+                status_msg_queue.put_nowait(payload)
+            except queue.Full:
+                logger.warning("状态消息队列已满，丢弃一条状态上报")
+        # elif topic.endswith("/status"):
+        #     data_root = payload.get("data", {})
+        #     print_state = data_root.get("print_state", "unknown")
+
+        #     # 温度安全取值
+        #     temp_root = data_root.get("temperature", {})
+        #     nozzle_info = temp_root.get("nozzle", {})
+        #     nozzle_temp = nozzle_info.get("current", 0.0)
+
+        #     # 打印进度安全取值
+        #     prog_root = data_root.get("print_progress", {})
+        #     progress = prog_root.get("progress_percent", 0.0)
+
+        #     logger.debug(f"📥 【实时状态】状态:{print_state} | 喷嘴:{nozzle_temp}℃ | 进度:{progress}%")
         
         # 事件告警
         elif topic.endswith("/event"):
-            event_level = payload["data"]["event_level"]
-            event_type = payload["data"]["event_type"]
-            event_code = payload["data"]["event_code"]
+            data_root = payload.get("data", {})
+            event_level = data_root.get("event_level", "unknown")
+            event_type = data_root.get("event_type", "")
+            event_code = data_root.get("event_code", 0)
+            event_data = data_root.get("event_data", {})
             logger.info(f"\n⚠️ 【事件上报】级别:{event_level} | 类型:{event_type} | 编码:{event_code}")
-            logger.info(f"  详情：{json.dumps(payload['data']['event_data'], ensure_ascii=False)}")
+            logger.info(f"  详情：{json.dumps(event_data, ensure_ascii=False)}")
         
         # 指令响应
         elif topic.endswith("/response"):
-            req_id = payload["data"]["request_id"]
-            result = payload["data"]["result"]
+            data_root = payload.get("data", {})
+            req_id = data_root.get("request_id", "")
+            result = data_root.get("result", -1)
+            err_code = data_root.get("error_code", 0)
+            err_msg = data_root.get("msg", "")
             with response_cond:
-                response_map[req_id] = payload
-                response_cond.notify_all()  # 通知等待的线程
-            logger.debug(f"📥 【指令响应】request_id:{req_id} | 结果:{result}")
-
+                if req_id:
+                    response_map[req_id] = payload
+                response_cond.notify_all()
+            if result != 0:
+                logger.error(f"❌ 指令执行失败 | 错误码:{err_code} | 原因:{err_msg}")
+            else:
+                logger.info(f"✅ 指令执行成功")
     except Exception as e:
         logger.error(f"消息解析异常：{e}, 原始内容：{msg.payload[:200]}")
+
+# 新增：单独线程消费status状态消息，不阻塞MQTT回调
+def status_consumer_thread():
+    while True:
+        try:
+            payload = status_msg_queue.get()
+            data_root = payload.get("data", {})
+            print_state = data_root.get("print_state", "unknown")
+            # 温度安全取值
+            temp_root = data_root.get("temperature", {})
+            nozzle_info = temp_root.get("nozzle", {})
+            nozzle_temp = nozzle_info.get("current", 0.0)
+            # 打印进度安全取值
+            prog_root = data_root.get("print_progress", {})
+            progress = prog_root.get("progress_percent", 0.0)
+            # logger.info(f"📥 【实时状态】状态:{print_state} | 喷嘴:{nozzle_temp}℃ | 进度:{progress}%")
+            logger.info(f"\n📥 【实时状态】队列剩余:{status_msg_queue.qsize()} | 状态:{print_state} | 喷嘴:{nozzle_temp}℃ | 进度:{progress}%")
+        except Exception as e:
+            logger.error(f"状态消息消费异常：{e}")
+        finally:
+            status_msg_queue.task_done()
 
 # ========== 同步指令发送（等待响应） ==========
 def send_cmd_wait(topic_suffix, cmd_type, data):
@@ -338,9 +385,23 @@ def console_mode():
                 ok, resp = PrinterCommands.home_all()
                 print("成功" if ok and resp["data"]["result"]==0 else "失败")
             elif cmd == "4":
-                fname = input("输入打印文件名：")
+                # 先查询文件列表
+                ok_list, resp_list = PrinterCommands.file_list()
+                file_names = []
+                # 安全分层取值，避免KeyError
+                resp_data = resp_list.get("data", {})
+                file_list_arr = resp_data.get("file_list", [])
+                if ok_list and file_list_arr:
+                    file_names = [f["file_name"] for f in file_list_arr]
+                fname = input("输入打印文件名: ").strip()
+                if not fname:
+                    logger.warning("文件名为空，取消下发打印指令")
+                    continue
+                if fname not in file_names:
+                    logger.error(f"文件 {fname} 不存在，可用文件列表：{file_names}")
+                    continue
                 ok, resp = PrinterCommands.print_start(fname)
-                print("成功" if ok and resp["data"]["result"]==0 else "失败")
+                print("成功" if ok and resp.get("data",{}).get("result") == 0 else "失败")
             elif cmd == "5":
                 ok, resp = PrinterCommands.print_pause()
                 print("成功" if ok and resp["data"]["result"]==0 else "失败")
@@ -362,7 +423,9 @@ def console_mode():
 
 # ========== 主程序入口 ==========
 if __name__ == "__main__":
-    client = mqtt.Client(client_id="pc_test_admin_001", callback_api_version=mqtt.CallbackAPIVersion.VERSION1)
+    # client = mqtt.Client(client_id="pc_test_admin_001", callback_api_version=mqtt.CallbackAPIVersion.VERSION1)
+    # 第二个参数clean_session=False
+    client = mqtt.Client(client_id="pc_test_admin_001", callback_api_version=mqtt.CallbackAPIVersion.VERSION1, clean_session=False)
     client.username_pw_set(MQTT_USER, MQTT_PWD)
 
     # 双向TLS配置
@@ -387,7 +450,9 @@ if __name__ == "__main__":
             time.sleep(3)
 
     client.loop_start()
+    # 新增：启动状态消息异步消费线程
+    threading.Thread(target=status_consumer_thread, daemon=True, name="status_consumer").start()
+    logger.info("状态消息异步消费线程已启动")
     time.sleep(1)  # 等待连接与订阅完成
-
     # 启动控制台交互
     console_mode()
