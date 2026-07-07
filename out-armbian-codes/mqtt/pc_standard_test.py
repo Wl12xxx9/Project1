@@ -38,6 +38,25 @@ client = None
 # 新增：状态消息异步队列，解耦on_message阻塞
 status_msg_queue = queue.Queue(maxsize=200)
 
+HELP_INFO = """
+===== 指令清单 =====
+0       退出程序
+1       查询全量状态
+2       设置喷嘴温度
+3       全轴归零
+4       开始打印
+5       暂停打印
+6       恢复打印
+7       停止打印
+8       获取文件列表
+9       一键自动测试
+10      AI开启检测
+11      AI抓拍
+12      灯条控制
+13      AI硬件开关
+h/help  打印本清单
+"""
+
 # ========== 日志初始化 ==========
 def init_logger():
     logger = logging.getLogger("mqtt_test")
@@ -161,7 +180,11 @@ def status_consumer_thread():
             prog_root = data_root.get("print_progress", {})
             progress = prog_root.get("progress_percent", 0.0)
             # logger.info(f"📥 【实时状态】状态:{print_state} | 喷嘴:{nozzle_temp}℃ | 进度:{progress}%")
-            logger.info(f"\n📥 【实时状态】队列剩余:{status_msg_queue.qsize()} | 状态:{print_state} | 喷嘴:{nozzle_temp}℃ | 进度:{progress}%")
+            # logger.info(f"\n📥 【实时状态】队列剩余:{status_msg_queue.qsize()} | 状态:{print_state} | 喷嘴:{nozzle_temp}℃ | 进度:{progress}%")
+            light_info = data_root.get("light", {})
+            ai_info = data_root.get("ai_camera", {})
+            # logger.info(f"【实时状态】队列剩余:{status_msg_queue.qsize()} | 打印:{print_state} | 喷嘴:{nozzle_temp}℃ | 进度:{progress}% "
+            # f"灯光开关:{light_info.get('switch')} AI硬件:{ai_info.get('hardware_switch')}")
         except Exception as e:
             logger.error(f"状态消息消费异常：{e}")
         finally:
@@ -306,6 +329,26 @@ class PrinterCommands:
         })
 
     @staticmethod
+    def ai_switch(enable: bool):
+        """摄像头硬件总开关"""
+        return send_cmd_wait("ai", "ai_camera_control", {
+            "action": "switch",
+            "enable": enable
+        })
+
+    # 8. 灯条控制类
+    @staticmethod
+    def light_ctrl(switch: bool, brightness=100, r=255, g=255, b=255, mode="normal"):
+        return send_cmd_wait("light", "light_control", {
+            "switch": switch,
+            "brightness": brightness,
+            "r": r,
+            "g": g,
+            "b": b,
+            "mode": mode
+        })
+
+    @staticmethod
     def ai_capture():
         """AI手动抓拍"""
         return send_cmd_wait("ai", "ai_camera_control", {"action": "capture"})
@@ -330,8 +373,13 @@ def auto_test_all():
         ("获取文件列表", lambda: PrinterCommands.file_list()),
         ("PID自整定（喷嘴200℃）", lambda: PrinterCommands.pid_tune(target="extruder", target_temp=200)),
         ("自动调平", lambda: PrinterCommands.bed_leveling()),
+        ("开启AI摄像头硬件", lambda: PrinterCommands.ai_switch(True)),
         ("AI摄像头模式设置", lambda: PrinterCommands.ai_set_mode(enable=True, mode="first_layer_detect")),
         ("AI手动抓拍", lambda: PrinterCommands.ai_capture()),
+        ("关闭AI摄像头硬件", lambda: PrinterCommands.ai_switch(False)),
+        ("灯条开启白光", lambda: PrinterCommands.light_ctrl(True, 100, 255, 255, 255)),
+        ("灯条呼吸模式", lambda: PrinterCommands.light_ctrl(True, 60, 255, 100, 100, "breath")),
+        ("关闭灯条", lambda: PrinterCommands.light_ctrl(False)),
     ]
 
     pass_count = 0
@@ -358,19 +406,24 @@ def auto_test_all():
 
 # ========== 控制台交互模式 ==========
 def console_mode():
-    """手动交互调试模式"""
-    print("\n" + "="*60)
-    print("📟 手动调试模式，输入指令编号执行")
-    print("  1. 查询全量状态    2. 设置温度    3. 全轴归零")
-    print("  4. 开始打印        5. 暂停打印    6. 恢复打印")
-    print("  7. 停止打印        8. 获取文件列表 9. 运行全量自动测试")
-    print("  10. AI开启检测模式  11.AI手动抓拍")
-    print("  0. 退出程序")
-    print("="*60)
+    # """手动交互调试模式"""
+    # print("\n" + "="*60)
+    # print("📟 手动调试模式，输入指令编号执行")
+    # print("  1. 查询全量状态    2. 设置温度    3. 全轴归零")
+    # print("  4. 开始打印        5. 暂停打印    6. 恢复打印")
+    # print("  7. 停止打印        8. 获取文件列表 9. 运行全量自动测试")
+    # print("  10. AI开启检测模式  11.AI手动抓拍  12. 灯条控制开关调色")
+    # print("  13. AI摄像头硬件总开关")
+    # print("  0. 退出程序")
+    # print("="*60)
 
+    print("输入 h / help 查看全部指令，0退出")
     while True:
         try:
             cmd = input("\n请输入指令编号：").strip()
+            if cmd in ("h", "help"):
+                print(HELP_INFO)
+                continue
             if cmd == "0":
                 client.disconnect()
                 logger.info("👋 程序退出")
@@ -424,6 +477,29 @@ def console_mode():
             elif cmd == "11":
                 ok, resp = PrinterCommands.ai_capture()
                 print(json.dumps(resp, indent=2, ensure_ascii=False) if ok else "抓拍超时")
+            elif cmd == "12":
+                try:
+                    light_switch = input("输入灯开关 true/false：").strip().lower() == "true"
+                    bri = int(input("亮度0-100："))
+                    # 新增范围校验
+                    if not 0 <= bri <= 100:
+                        print("亮度必须在0~100之间！")
+                        continue
+                    r = int(input("R 0-255："))
+                    g = int(input("G 0-255："))
+                    b = int(input("B 0-255："))
+                    if not (0<=r<=255 and 0<=g<=255 and 0<=b<=255):
+                        print("RGB数值必须0~255！")
+                        continue
+                    mode = input("模式 normal/breath/flash：").strip()
+                    ok, resp = PrinterCommands.light_ctrl(light_switch, bri, r, g, b, mode)
+                    print(json.dumps(resp, indent=2, ensure_ascii=False) if ok else "失败")
+                except ValueError:
+                    print("输入错误，亮度/RGB必须输入数字！")
+            elif cmd == "13":
+                ai_hw_switch = input("摄像头硬件开关 true/false：").strip().lower() == "true"
+                ok, resp = PrinterCommands.ai_switch(ai_hw_switch)
+                print(json.dumps(resp, indent=2, ensure_ascii=False) if ok else "失败")
             else:
                 print("无效指令")
         except Exception as e:

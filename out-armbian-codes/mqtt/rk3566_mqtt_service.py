@@ -106,8 +106,10 @@ ERROR_CODE = {
     "FILE_NOT_EXIST": 3001,
     "MCU_TIMEOUT": 4002,
     "SYSTEM_ERROR": 5000,
-    "RTSP_STREAM_ERROR":6000,
-    "AI_DETECT_ABNORMAL":6001
+    "AI_CAMERA_CLOSED": 6000,
+    "AI_STREAM_TIMEOUT": 6001,
+    "AI_HW_ERROR": 6002,
+    "LIGHT_PARAM_INVALID": 6100
 }
 
 # 状态转移允许规则（状态前置校验依据）
@@ -521,15 +523,70 @@ class STM32Adapter:
         elif cmd_type == "ai_camera_control":
             logger.info(f"【业务分支-ai_camera_control】原始入参 params={params}")
             action = params.get("action")
-            if action == "capture":
-                success, result = self._capture_snapshot()
-                return success, result, ERROR_CODE["SUCCESS"] if success else ERROR_CODE["SYSTEM_ERROR"]
-            elif action == "set_mode":
-                enable = params.get("enable", True)
-                mode = params.get("mode", "")
-                # 调用StatusManager切换AI模式
-                self.status_mgr.set_ai_mode(enable, mode)
-                return True, {"enable": enable, "mode": mode}, ERROR_CODE["SUCCESS"]
+            if action == "switch":
+                hw_enable = params.get("enable", False)
+                # 切换摄像头硬件总开关
+                with self.status_mgr.status_lock:
+                    self.status_mgr.status_cache["ai_camera"]["hardware_switch"] = hw_enable
+                # 推送开关变更事件
+                # self.mqtt_service.publish_event(
+                #     level="info",
+                #     event_type="ai_camera_switch",
+                #     event_code=6000,
+                #     event_data={"hardware_switch": hw_enable}
+                # )
+                # 关闭时停止AI线程、关闭RTSP
+                if not hw_enable:
+                    self.status_mgr.status_cache["ai_camera"]["ai_thread_exit"] = True
+                return True, {"hardware_switch": hw_enable}, ERROR_CODE["SUCCESS"]
+            elif action in ["capture", "set_mode"]:
+                # 先判断硬件开关是否开启，关闭直接返回错误
+                hw_state = self.status_mgr.status_cache["ai_camera"].get("hardware_switch", False)
+                if not hw_state:
+                    return False, {}, ERROR_CODE["AI_CAMERA_CLOSED"]
+                action = params.get("action")
+                if action == "capture":
+                    success, result = self._capture_snapshot()
+                    return success, result, ERROR_CODE["SUCCESS"] if success else ERROR_CODE["SYSTEM_ERROR"]
+                elif action == "set_mode":
+                    enable = params.get("enable", True)
+                    mode = params.get("mode", "")
+                    # 调用StatusManager切换AI模式
+                    self.status_mgr.set_ai_mode(enable, mode)
+                    return True, {"enable": enable, "mode": mode}, ERROR_CODE["SUCCESS"]
+        elif cmd_type == "light_control":
+            # 解析灯光参数，做数值校验
+            switch = params.get("switch", False)
+            bri = params.get("brightness", 100)
+            r = params.get("r", 255)
+            g = params.get("g", 255)
+            b = params.get("b", 255)
+            mode = params.get("mode", "normal")
+            # 参数合法性校验
+            if not (0 <= bri <= 100 and 0<=r<=255 and 0<=g<=255 and 0<=b<=255):
+                logger.error(f"灯光参数非法：亮度{bri}、R{r}、G{g}、B{b}，亮度需0~100，RGB需0~255")
+                return False, {}, ERROR_CODE["LIGHT_PARAM_INVALID"]
+            valid_modes = ["normal", "breath", "flash"]
+            if mode not in valid_modes:
+                return False, {}, ERROR_CODE["LIGHT_PARAM_INVALID"]
+            # MOCK模式直接更新内存灯光状态，真实硬件下发GPIO/PWM控制指令
+            if MOCK_MOONRAKER:
+                self.status_mgr.status_cache["light"] = {
+                    "switch": switch,
+                    "brightness": bri,
+                    "r": r, "g": g, "b": b,
+                    "mode": mode
+                }
+                return True, {}, ERROR_CODE["SUCCESS"]
+            # 真实硬件：下发灯条控制GPIO/PWM指令（此处预留硬件调用）
+            # hw_light_ctrl(switch, bri, r, g, b, mode)
+            self.status_mgr.status_cache["light"]["switch"] = switch
+            self.status_mgr.status_cache["brightness"] = bri
+            self.status_mgr.status_cache["r"] = r
+            self.status_mgr.status_cache["g"] = g
+            self.status_mgr.status_cache["b"] = b
+            self.status_mgr.status_cache["mode"] = mode
+            return True, {}, ERROR_CODE["SUCCESS"]
         # 5. AI、文件查询类直接本地处理，不进Klipper
         return True, {}, ERROR_CODE["SUCCESS"]
 
@@ -695,7 +752,16 @@ class StatusManager:
                 "total_layers": 0,
                 "filament_used_mm": 0
             },
+            "light": {
+                "switch": False,
+                "brightness": 100,
+                "r": 255,
+                "g": 255,
+                "b": 255,
+                "mode": "normal"
+            },
             "ai_camera": {
+                "hardware_switch": False, # 新增硬件总开关
                 "enabled": False,
                 "current_mode": None,
                 "last_detect_result": "normal",
@@ -703,7 +769,7 @@ class StatusManager:
                 "abnormal_type": None,
                 "detect_running": False,
                 "last_snap_time": 0,
-                "ai_thread_exit": False
+                "ai_thread_exit": False,
             },
             "system_status": {
                 "cpu_usage": 0,
@@ -1160,7 +1226,8 @@ class MQTTService:
                 (f"device/{DEVICE_ID}/cmd/motion", 1),
                 (f"device/{DEVICE_ID}/cmd/file", 1),
                 (f"device/{DEVICE_ID}/cmd/system", 1),
-                (f"device/{DEVICE_ID}/cmd/ai", 1)
+                (f"device/{DEVICE_ID}/cmd/ai", 1),
+                (f"device/{DEVICE_ID}/cmd/light", 1),
             ]
             client.subscribe(cmd_topics)
             logger.info("所有下行指令Topic订阅完成")
@@ -1379,6 +1446,14 @@ class MQTTService:
                     
         # 3. 分发到STM32/Klipper执行
         success, result, err_code = self.stm32.send_command(cmd_type, data)
+        # 新增：AI开关成功后推送事件
+        if cmd_type == "ai_camera_control" and data.get("action") == "switch" and success:
+            self.publish_event(
+                level="info",
+                event_type="ai_camera_switch",
+                event_code=6000,
+                event_data={"hardware_switch": data.get("enable")}
+            )
         logger.info(f"【硬件调用返回】request_id={request_id}, success={success}, err_code={err_code}, result摘要={str(result)[:200]}")
         if not success:
             self._send_error_response(request_id, cmd_type, err_code, "硬件执行失败")
@@ -1468,7 +1543,13 @@ class MQTTService:
                 "mcu_firmware_version": MCU_FIRMWARE_VERSION,
                 "app_firmware_version": APP_VERSION,
                 "protocol_version": PROTOCOL_VERSION
-            }
+            },
+            "light_config": {
+                "support": True,
+                "channel_count": 3,
+                "max_brightness": 100,
+                "support_mode": ["normal", "breath", "flash"],
+            },
         }
 
     def _publish_device_info(self):
@@ -1535,7 +1616,7 @@ class MQTTService:
                         msg = self._build_common_header("status")
                         msg["data"] = status
                         self.publish(f"device/{DEVICE_ID}/status", msg, qos=1)
-                        logger.debug(f"【定时上报成功 第{loop_cnt}次】打印状态:{status['print_state']}")
+                        # logger.debug(f"【定时上报成功 第{loop_cnt}次】打印状态:{status['print_state']}")
                         loop_cnt += 1
                 except Exception as e:
                     logger.error(f"【上报单次异常】{e}", exc_info=True)
