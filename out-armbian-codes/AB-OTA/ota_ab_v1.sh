@@ -106,8 +106,11 @@ echo "目标分区系统写入完成"
 # ======================步骤4：切换启动标记（自动确认GPT容量警告）======================
 echo -e "\n=====================【阶段5 切换分区boot启动标记】===================="
 # 3. 关闭原分区boot标记，开启目标分区boot标记
-echo yes | parted --fix -s ${PART_PREFIX} set ${SRC_BOOT_PART_NUM} boot off
-echo yes | parted --fix -s ${PART_PREFIX} set ${TARGET_PART_NUM} boot on
+echo "关闭原分区${SRC_BOOT_PART_NUM}的boot启动标识"
+parted --fix -s ${PART_PREFIX} set ${SRC_BOOT_PART_NUM} boot off 2>/dev/null
+
+echo "开启目标分区${TARGET_PART_NUM}的boot启动标识"
+parted --fix -s ${PART_PREFIX} set ${TARGET_PART_NUM} boot on 2>/dev/null
 udevadm trigger --subsystem-match=block
 sync
 
