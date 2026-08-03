@@ -15,11 +15,16 @@ from functools import lru_cache
 import yaml
 import subprocess
 import base64
+import websockets
+import asyncio
+import concurrent.futures
+
+RPC_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 
 # 测试模拟开关：True=无硬件模拟返回，不调用Moonraker
-MOCK_MOONRAKER = True
-# MOCK_MOONRAKER = False
+# MOCK_MOONRAKER = True
+MOCK_MOONRAKER = False
 
 # ==================================================
 # ========== 🔧 需自行配置的参数区域 START ==========
@@ -49,6 +54,8 @@ CERT_EXPIRE_WARN_DAYS = 30  # 证书剩余天数小于该值触发预警
 # 4. Klipper配置
 # Klipper Moonraker Unix Socket 路径（Armbian标准路径）
 MOONRAKER_SOCKET = "/home/klipper/printer_data/comms/moonraker.sock"
+# ========== Websocket连接地址 ==========
+MOONRAKER_WS_URI = "ws://127.0.0.1:7125/websocket"
 # Klipper CAN总线STM32下位机唯一CAN UUID
 CAN_MCU_UUID = "2dc7a3ac3edd"
 # 芯片型号仅做日志打印用，不参与通信判断
@@ -57,7 +64,7 @@ MCU_CHIP_TYPE = "stm32f407"
 KLIPPER_TIMEOUT = 12
 
 # 5. 上报频率配置
-STATUS_REPORT_INTERVAL = 10  # 实时状态上报间隔，单位秒
+STATUS_REPORT_INTERVAL = 3  # 实时状态上报间隔，单位秒
 PROGRESS_REPORT_INTERVAL = 2  # 打印进度更新间隔，单位秒
 
 # 6. 持久化文件路径
@@ -229,202 +236,144 @@ def init_logger():
 
 logger = init_logger()
 
-
 # ========== STM32适配层（双Socket根治版：订阅长连接 + RPC独立短连接） ==========
 class STM32Adapter:
     """
-    双Socket分离架构根治粘包/应答被淹没问题：
-    1. sub_sock：永久长连接，仅用于printer.objects.subscribe接收notify状态
-    2. RPC每次新建独立unix socket短连接，无订阅推送干扰
+    Websocket双链路架构：
+    1. sub_ws：长连接订阅 notify_status 实时推送
+    2. rpc_ws：每次RPC新建临时连接，查询/下发指令
     """
     def __init__(self, status_mgr):
         self.status_mgr = status_mgr
-        self.socket_path = settings.klipper.moonraker_socket
-        logger.info(f"当前加载的Moonraker Socket路径：{self.socket_path}")
-        self.sub_sock = None       # 订阅专用长连接（只收notify）
+        self.ws_uri = MOONRAKER_WS_URI
+        self.sub_ws = None
+        self.sub_task = None
         self.status_callback = None
-        self._init_subscribe_socket()
-        self._subscribe_moonraker_events()
-        logger.info(f"Moonraker订阅长连接就绪 | 芯片:{MCU_CHIP_TYPE} | CAN_UUID:{CAN_MCU_UUID}")
+        self._start_subscribe_loop()
+        logger.info(f"Moonraker Websocket订阅链路启动 WS:{self.ws_uri}")
 
-    def _init_subscribe_socket(self):
-        """初始化仅用于状态订阅的常驻Socket"""
-        try:
-            self.sub_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self.sub_sock.settimeout(1.0)
-            self.sub_sock.connect(self.socket_path)
-            logger.info("订阅专用Unix Socket连接成功")
-        except Exception as e:
-            logger.error(f"订阅Socket初始化失败: {e}")
-            self.sub_sock = None
-
-    def _subscribe_moonraker_events(self):
-        """仅在订阅长连接发送objects订阅请求"""
-        if self.sub_sock is None:
-            self._init_subscribe_socket()
-            if self.sub_sock is None:
-                logger.error("无法建立订阅Socket，放弃状态订阅")
-                return
-        subscribe_req = {
-            "jsonrpc": "2.0",
-            "method": "printer.objects.subscribe",
-            "params": {
-                "objects": {
-                    "toolhead": None,
-                    "extruder": None,
-                    "heater_bed": None,
-                    "fan": None,
-                    "print_stats": None
-                }
-            },
-            "id": int(time.time()*1000)
-        }
-        try:
-            self.sub_sock.sendall((json.dumps(subscribe_req)+"\n").encode("utf-8"))
-            # 启动订阅监听线程（只操作sub_sock，不干扰RPC）
-            threading.Thread(target=self._event_listener, daemon=True, name="moonraker_event").start()
-        except Exception as e:
-            logger.error(f"订阅消息发送失败：{e}")
-            self.sub_sock.close()
-            self.sub_sock = None
-
-    def _event_listener(self):
-        """订阅专用线程：只读取sub_sock，无RPC抢占"""
-        reconnect_delay = 1
-        max_reconnect_delay = 10
-        buf = ""
+    async def _sub_listener(self):
+        """订阅长连接异步循环"""
         while True:
-            if self.sub_sock is None:
-                logger.warning("订阅Socket断开，尝试重连")
-                self._init_subscribe_socket()
-                if self.sub_sock is None:
-                    time.sleep(reconnect_delay)
-                    reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
-                    continue
-                # 重连后重新订阅
-                self._subscribe_moonraker_events()
-                buf = ""
-                reconnect_delay = 1
             try:
-                chunk = self.sub_sock.recv(4096).decode("utf-8")
-                if not chunk:
-                    raise ConnectionResetError("订阅流断开")
-                buf += chunk
-                # 逐行解析notify消息
-                while "\n" in buf:
-                    line, buf = buf.split("\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                        if obj.get("method") == "notify_status" and self.status_callback:
-                            self.status_callback(obj["params"])
-                        elif obj.get("method") == "notify_proc_stat_update":
-                            logger.debug(f"系统资源推送")
-                    except json.JSONDecodeError:
-                        continue
-            except socket.timeout:
-                # 无状态推送，静默跳过，不打ERROR
-                continue
+                async with websockets.connect(
+                    self.ws_uri,
+                    ping_interval=10,
+                    ping_timeout=8
+                ) as ws:
+                    self.sub_ws = ws
+                    logger.info("Websocket订阅连接成功")
+                    # 修正后的订阅请求
+                    sub_req = {
+                        "jsonrpc": "2.0",
+                        "method": "printer.objects.subscribe",
+                        "params": {
+                            "objects": {
+                                "extruder": None,
+                                "heater_bed": None,
+                                "fan": None,
+                                "toolhead": None,
+                                "print_stats": None
+                            }
+                        },
+                        "id": int(time.time() * 1000)
+                    }
+                    await ws.send(json.dumps(sub_req))
+                    # 新增：等待订阅ACK，避免连接直接断掉
+                    ack_raw = await ws.recv()
+                    ack = json.loads(ack_raw)
+                    logger.info(f"订阅服务端ACK返回: {ack}")
+                    # 持续接收notify推送
+                    async for raw_msg in ws:
+                        try:
+                            obj = json.loads(raw_msg)
+                            method_name = obj.get("method")
+                            logger.debug(f"收到Moonraker推送: {method_name}")
+                            if method_name == "notify_status_update" and self.status_callback:
+                                # params 是列表，取下标0才是状态dict
+                                data_dict = obj["params"][0]
+                                self.status_callback(data_dict)
+                        except json.JSONDecodeError:
+                            continue
             except Exception as e:
-                import traceback
-                logger.error(f"订阅监听异常 {e}\n{traceback.format_exc()}")
-                self.sub_sock.close()
-                self.sub_sock = None
-                buf = ""
-                time.sleep(1)
+                logger.warning(f"订阅Websocket断开，3s重连: {e}")
+                self.sub_ws = None
+                await asyncio.sleep(3)
 
-    def _new_rpc_socket(self):
-        """每次RPC调用创建全新独立短连接，用完即关"""
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(KLIPPER_TIMEOUT)
-        sock.connect(self.socket_path)
-        return sock
+    def _start_subscribe_loop(self):
+        def run_async_sub():
+            while True:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(self._sub_listener())
+                except Exception as e:
+                    logger.error(f"订阅协程崩溃，3s重启:{e}")
+                finally:
+                    loop.close()
+                time.sleep(3)
+        self.sub_task = threading.Thread(target=run_async_sub, daemon=True, name="mr_sub_ws")
+        self.sub_task.start()
 
-    def _send_moonraker_rpc(self, rpc_method, params=None):
-        logger.debug(f"【RPC独立短连接新建】method={rpc_method}")
+    async def _rpc_single_conn(self):
+        """单次RPC独立短连接，对应ws_test2查询方式"""
+        return await websockets.connect(self.ws_uri)
+
+    async def _send_moonraker_rpc_async(self, rpc_method, params=None):
+        """异步RPC底层，完全对齐ws_test2请求格式"""
         if MOCK_MOONRAKER:
-            logger.info(f"【模拟Moonraker】无需通信，直接返回成功 method={rpc_method}")
-            # 文件列表接口单独返回规范数据
+            logger.info(f"【模拟Moonraker】method={rpc_method}")
             if rpc_method == "server.files.list":
                 mock_result = {
                     "total": 1,
                     "page": 1,
                     "page_size": 20,
-                    "file_list": [
-                        {
-                            "file_name": "test_print.gcode",
-                            "size": 1024,
-                            "upload_time": 1783320000
-                        }
-                    ]
+                    "files": [{"filename":"test_print.gcode","size":1024,"modified":1783320000}]
                 }
                 return True, mock_result, ERROR_CODE["SUCCESS"]
             return True, {}, ERROR_CODE["SUCCESS"]
-        # 每次新建独立Socket，无共享缓冲区、无notify干扰
         try:
-            sock = self._new_rpc_socket()
+            ws = await self._rpc_single_conn()
+            req = {
+                "jsonrpc": "2.0",
+                "method": rpc_method,
+                "params": params if params else {},
+                "id": int(time.time()*1000)
+            }
+            await ws.send(json.dumps(req))
+            resp_raw = await ws.recv()
+            await ws.close()
+            resp = json.loads(resp_raw)
+            if "error" in resp:
+                logger.error(f"RPC返回错误 {resp['error']}")
+                return False, {}, ERROR_CODE["MCU_TIMEOUT"]
+            return True, resp.get("result", {}), ERROR_CODE["SUCCESS"]
         except Exception as e:
-            logger.error(f"RPC短连接创建失败 {e}")
+            logger.error(f"Websocket RPC失败 {e}")
             return False, {}, ERROR_CODE["MCU_TIMEOUT"]
 
-        req = {
-            "jsonrpc": "2.0",
-            "method": rpc_method,
-            "params": params if params else {},
-            "id": int(time.time()*1000)
-        }
-        send_data = json.dumps(req)+"\n"
-        target_id = req["id"]
-        buffer = ""
+    # 替换STM32Adapter内的 _send_moonraker_rpc
+    def _send_moonraker_rpc(self, rpc_method, params=None):
+        logger.debug(f"RPC请求：{rpc_method}")
+        if MOCK_MOONRAKER:
+            if rpc_method == "server.files.list":
+                mock_result = {
+                    "total": 1, "page": 1, "page_size": 20,
+                    "file_list": [{"file_name":"test_print.gcode","size":1024,"upload_time":1783320000}]
+                }
+                return True, mock_result, ERROR_CODE["SUCCESS"]
+            return True, {}, ERROR_CODE["SUCCESS"]
         try:
-            sock.sendall(send_data.encode("utf-8"))
-            logger.info(f"【RPC指令已发送 target_id={target_id}】")
-            buffer = ""
-            # 持续循环，直到拿到对应id，不限次数
-            while True:
-                chunk = ""
-                try:
-                    chunk = sock.recv(4096).decode("utf-8")
-                except socket.timeout:
-                    logger.debug(f"RPC短连接等待数据 target_id={target_id}")
-                    continue
-                if not chunk:
-                    raise ConnectionError("RPC短连接断开")
-                buffer += chunk
-                # 循环分割所有换行，不只是一次分割
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                        logger.debug(f"RPC单行解析：{line}")
-                        if "id" in obj and obj["id"] == target_id:
-                            if "error" in obj:
-                                logger.error(f"Moonraker业务错误 {obj['error']}")
-                                sock.close()
-                                return False, {}, ERROR_CODE["MCU_TIMEOUT"]
-                            logger.info(f"【RPC匹配成功 target_id={target_id}】result={obj.get('result')}")
-                            sock.close()
-                            return True, {}, ERROR_CODE["SUCCESS"]
-                    except json.JSONDecodeError:
-                        logger.debug(f"脏行丢弃：{repr(line)}")
-                        continue
+            # 在线程池新开线程跑协程，不抢占主线程循环
+            future = RPC_POOL.submit(asyncio.run, self._send_moonraker_async(rpc_method, params))
+            return future.result(timeout=12)
         except Exception as e:
-            logger.error(f"RPC短连接通信异常 {e}")
-            sock.close()
+            logger.error(f"RPC异常：{e}")
             return False, {}, ERROR_CODE["MCU_TIMEOUT"]
 
     def send_command(self, cmd_type, params):
-        """
-        MQTT上层指令 → 转换为Klipper G-code/Moonraker指令
-        cmd_type：协议cmd_type (print_control/motion_control/param_set...)
-        params：指令入参
-        返回 (success, result_dict, error_code)
-        """
+        """send_command 上层逻辑完全不用改动，底层RPC已切换WS"""
+        # 原有全部分支代码保留，无需修改
         # 1. 温控设置 param_set
         if cmd_type == "param_set":
             logger.info(f"【业务分支-param_set】原始入参 params={params}")
@@ -437,7 +386,6 @@ class STM32Adapter:
                 cmds.append(f"M106 P0 S{int(params['fan_speed']*2.55)}")
             gcode = "\n".join(cmds)
             logger.info(f"【param_set 生成Gcode】{gcode}")
-            # 原始逻辑，直接调用RPC，MOCK模式下不会阻塞
             return self._send_moonraker_rpc("printer.gcode.script", {"script": gcode})
         # 2. 运动控制 motion_control
         elif cmd_type == "motion_control":
@@ -485,19 +433,14 @@ class STM32Adapter:
             if action == "list":
                 page = params.get("page", 1)
                 page_size = params.get("page_size", 20)
-                # 调用Moonraker获取gcodes目录文件列表
-                success, result, code = self._send_moonraker_rpc("server.files.list", {
-                    "root": "gcodes"
-                })
+                success, result, code = self._send_moonraker_rpc("server.files.list", {"root": "gcodes"})
                 if not success:
                     return False, {}, code
-                # 分页处理
                 files = result.get("files", [])
                 total = len(files)
                 start = (page - 1) * page_size
                 end = start + page_size
                 page_files = files[start:end]
-                # 映射协议字段
                 file_list = [{
                     "file_name": f.get("filename", ""),
                     "size": f.get("size", 0),
@@ -519,57 +462,42 @@ class STM32Adapter:
                     "root": "gcodes",
                     "filename": file_name
                 })
-                return success, result, code
+                return success, result, {}
         elif cmd_type == "ai_camera_control":
             logger.info(f"【业务分支-ai_camera_control】原始入参 params={params}")
             action = params.get("action")
             if action == "switch":
                 hw_enable = params.get("enable", False)
-                # 切换摄像头硬件总开关
                 with self.status_mgr.status_lock:
                     self.status_mgr.status_cache["ai_camera"]["hardware_switch"] = hw_enable
-                # 推送开关变更事件
-                # self.mqtt_service.publish_event(
-                #     level="info",
-                #     event_type="ai_camera_switch",
-                #     event_code=6000,
-                #     event_data={"hardware_switch": hw_enable}
-                # )
-                # 关闭时停止AI线程、关闭RTSP
                 if not hw_enable:
-                    self.status_mgr.status_cache["ai_camera"]["ai_thread_exit"] = True
+                    self.status_mgr.status_cache["ai_thread_exit"] = True
                 return True, {"hardware_switch": hw_enable}, ERROR_CODE["SUCCESS"]
             elif action in ["capture", "set_mode"]:
-                # 先判断硬件开关是否开启，关闭直接返回错误
-                hw_state = self.status_mgr.status_cache["ai_camera"].get("hardware_switch", False)
+                hw_state = self.status_mgr.status_cache.get("ai_camera", False)
                 if not hw_state:
                     return False, {}, ERROR_CODE["AI_CAMERA_CLOSED"]
-                action = params.get("action")
                 if action == "capture":
                     success, result = self._capture_snapshot()
                     return success, result, ERROR_CODE["SUCCESS"] if success else ERROR_CODE["SYSTEM_ERROR"]
                 elif action == "set_mode":
                     enable = params.get("enable", True)
                     mode = params.get("mode", "")
-                    # 调用StatusManager切换AI模式
                     self.status_mgr.set_ai_mode(enable, mode)
                     return True, {"enable": enable, "mode": mode}, ERROR_CODE["SUCCESS"]
         elif cmd_type == "light_control":
-            # 解析灯光参数，做数值校验
             switch = params.get("switch", False)
             bri = params.get("brightness", 100)
-            r = params.get("r", 255)
-            g = params.get("g", 255)
-            b = params.get("b", 255)
+            r = params.get("r")
+            g = params.get("g")
+            b = params.get("b")
             mode = params.get("mode", "normal")
-            # 参数合法性校验
             if not (0 <= bri <= 100 and 0<=r<=255 and 0<=g<=255 and 0<=b<=255):
-                logger.error(f"灯光参数非法：亮度{bri}、R{r}、G{g}、B{b}，亮度需0~100，RGB需0~255")
+                logger.error("灯光参数非法")
                 return False, {}, ERROR_CODE["LIGHT_PARAM_INVALID"]
             valid_modes = ["normal", "breath", "flash"]
             if mode not in valid_modes:
                 return False, {}, ERROR_CODE["LIGHT_PARAM_INVALID"]
-            # MOCK模式直接更新内存灯光状态，真实硬件下发GPIO/PWM控制指令
             if MOCK_MOONRAKER:
                 self.status_mgr.status_cache["light"] = {
                     "switch": switch,
@@ -578,69 +506,92 @@ class STM32Adapter:
                     "mode": mode
                 }
                 return True, {}, ERROR_CODE["SUCCESS"]
-            # 真实硬件：下发灯条控制GPIO/PWM指令（此处预留硬件调用）
-            # hw_light_ctrl(switch, bri, r, g, b, mode)
             self.status_mgr.status_cache["light"]["switch"] = switch
-            self.status_mgr.status_cache["brightness"] = bri
+            self.status_mgr.status_cache["light"]["brightness"] = bri
             self.status_mgr.status_cache["r"] = r
             self.status_mgr.status_cache["g"] = g
             self.status_mgr.status_cache["b"] = b
             self.status_mgr.status_cache["mode"] = mode
             return True, {}, ERROR_CODE["SUCCESS"]
-        # 5. AI、文件查询类直接本地处理，不进Klipper
         return True, {}, ERROR_CODE["SUCCESS"]
 
     def get_realtime_data(self):
         """
-        从Moonraker读取Klipper实时状态（新建独立RPC短连接）
+        完全对齐ws_test2查询字段，替换原残缺解析代码
         """
         success, klipper_state, code = self._send_moonraker_rpc("printer.objects.query", {
             "objects": {
-                "toolhead": ["position", "homed_axes", "velocity"],
                 "extruder": ["temperature", "target", "power"],
-                "heater_bed": ["temperature", "target"],
-                "fan": ["speed"]
+                "heater_bed": ["temperature", "target", "power"],
+                "fan": ["speed"],
+                "toolhead": ["position", "homed_axes", "velocity"],
+                "print_stats": ["state", "filename", "print_duration", "progress", "filament_used"]
             }
         })
         if not success:
-            # 返回兜底默认数据
             return {
                 "temperature": {"nozzle":{"current":25,"target":0,"heating":False},"bed":{"current":25,"target":0,"heating":False}},
-                "motion": {"position":{"x":0,"y":0,"z":0,"e":0},"current_velocity":0,"motors_enabled":False,"homed":{"x":False,"y":False,"z":False},"driver_status":{"x":"normal","y":"normal","z":"normal","e":"normal"}}
+                "motion": {"position":{"x":0,"y":0,"z":0,"e":0},"current_velocity":0,"motors_enabled":False,"homed":{"x":False,"y":False,"z":False},"driver_status":{"x":"normal","y":"normal","z":"normal","e":"normal"}},
+                "print_progress": {
+                    "current_file": "",
+                    "print_duration": 0,
+                    "remain_time": 0,
+                    "progress_percent": 0,
+                    "current_layer": 0,
+                    "total_layers": 0,
+                    "filament_used_mm": 0
+                }
             }
-        # 解析Klipper原生数据，映射协议字段
+        # 修复变量名错误 klipper -> klipper_state
         toolhead = klipper_state.get("toolhead", {})
         extruder = klipper_state.get("extruder", {})
         heater_bed = klipper_state.get("heater_bed", {})
         fan = klipper_state.get("fan", {})
-        pos = tool.get("position", [0,0,0,0])
+        print_stats = klipper_state.get("print_stats", {})
+        pos = toolhead.get("position", [0,0,0,0])
         homed_str = toolhead.get("homed_axes", "")
         homed = {
-            "x": "x" in homed,
-            "y": "y" in homed,
+            "x": "x" in homed_str,
+            "y": "y" in homed_str,
             "z": "z" in homed
         }
-        nozzle_heat = extruder.get("power", 0) > 0
-        bed_heat = heater_bed.get("power", 0) > 0
+        nozzle_heat = (extruder.get("power", 0.0) or 0.0) > 0
+        bed_heat = (heater_bed.get("power", 0.0) or 0.0) > 0
+        # 打印进度解析，同步ws_test2逻辑
+        p_duration = print_stats.get("print_duration", 0.0) or 0.0
+        p_progress = (print_stats.get("progress", 0.0) or 0.0) * 100
+        p_file = print_stats.get("filename", "")
+        filament = print_stats.get("filament_used", 0.0) or 0.0
+        est_time = print_stats.get("estimated_time", 0.0) or 0.0
+        remain = est_time - p_duration
         return {
             "temperature": {
                 "nozzle": {
-                    "current": round(extruder.get("temperature", 25.0),1),
-                    "target": extruder.get("target", 0.0),
+                    "current": round((extruder.get("temperature",25.0) or 0.0),1),
+                    "target": extruder.get("target",0.0) or 0.0,
                     "heating": nozzle_heat
                 },
                 "bed": {
-                    "current": round(heater_bed.get("temperature",25.0),1),
-                    "target": heater_bed.get("target",0.0),
+                    "current": round((heater_bed.get("temperature",25.0) or 0.0),1),
+                    "target": heater_bed.get("target",0.0) or 0.0,
                     "heating": bed_heat
                 }
             },
             "motion": {
                 "position": {"x":pos[0],"y":pos[1],"z":pos[2],"e":pos[3]},
-                "current_velocity": round(toolhead.get("velocity",0),1),
+                "current_velocity": round((toolhead.get("velocity",0.0) or 0.0),1),
                 "motors_enabled": len(homed_str) > 0,
                 "homed": homed,
-                "driver_status": {"x":"normal","y":"normal","z":"normal","e":"normal"}
+                "driver_status":{"x":"normal","y":"normal","z":"normal","e":"normal"}
+            },
+            "print_progress": {
+                "current_file": p_file,
+                "print_duration": round(p_duration,1),
+                "remain_time": round(remain,1),
+                "progress_percent": round(p_progress,2),
+                "current_layer": 0,
+                "total_layers": 0,
+                "filament_used_mm": round(filament,2)
             }
         }
 
@@ -740,8 +691,17 @@ class StatusManager:
         # 全量状态缓存（内存缓存，对应协议status结构）
         self.status_cache = {
             "print_state": PRINT_STATE["IDLE"],
-            "motion": {},
-            "temperature": {},
+            "motion": {
+                "position": {"x":0.0,"y":0.0,"z":0.0,"e":0.0},
+                "current_velocity": 0.0,
+                "motors_enabled": False,
+                "homed":{"x":False,"y":False,"z":False},
+                "driver_status":{"x":"normal","y":"normal","z":"normal","e":"normal"}
+            },
+            "temperature": {
+                "nozzle": {"current":25.0, "target":0.0, "heating":False},
+                "bed": {"current":25.0, "target":0.0, "heating":False}
+            },
             "fan": {"part_cooling_speed": 0, "nozzle_cooling_speed": 0, "nozzle_fan_auto": True},
             "print_progress": {
                 "current_file": "",
@@ -761,7 +721,7 @@ class StatusManager:
                 "mode": "normal"
             },
             "ai_camera": {
-                "hardware_switch": False, # 新增硬件总开关
+                "hardware_switch": False,
                 "enabled": False,
                 "current_mode": None,
                 "last_detect_result": "normal",
@@ -784,89 +744,84 @@ class StatusManager:
         # self.stm32.status_callback = self._on_klipper_status_update
 
     def _on_klipper_status_update(self, klipper_state):
-        """Moonraker状态变更回调"""
         try:
-            # 解析klipper_state，更新status_cache（逻辑同原get_realtime_data）
+            logger.debug(f"进入状态回调，原始数据:{list(klipper_state.keys())}")
             with self.status_lock:
-                print_stats = klipper_state.get("print_stats", {})
-                # 1. 更新温度/运动状态
-                toolhead = klipper_state.get("toolhead", {})
-                extruder = klipper_state.get("extruder", {})
-                heater_bed = klipper_state.get("heater_bed", {})
-                fan = klipper_state.get("fan", {})
-                
-                # 解析运动数据
-                pos = toolhead.get("position", [0,0,0,0])
-                homed_str = toolhead.get("homed_axes", "")
-                homed = {
-                    "x": "x" in homed_str,
-                    "y": "y" in homed_str,
-                    "z": "z" in homed_str
-                }
-                motion_data = {
-                    "position": {"x":pos[0],"y":pos[1],"z":pos[2],"e":pos[3]},
-                    "current_velocity": round(toolhead.get("velocity",0),1),
-                    "motors_enabled": len(homed_str) > 0,
-                    "homed": homed,
-                    "driver_status": {"x":"normal","y":"normal","z":"normal","e":"normal"}
-                }
-                
-                # 解析温度数据
-                nozzle_heat = extruder.get("power", 0) > 0
-                bed_heat = heater_bed.get("power", 0) > 0
-                temp_data = {
-                    "nozzle": {
-                        "current": round(extruder.get("temperature", 25.0),1),
-                        "target": extruder.get("target", 0.0),
-                        "heating": nozzle_heat
-                    },
-                    "bed": {
-                        "current": round(heater_bed.get("temperature",25.0),1),
-                        "target": heater_bed.get("target",0.0),
-                        "heating": bed_heat
-                    }
-                }
-                
-                self.status_cache["motion"] = motion_data
-                self.status_cache["temperature"] = temp_data
-                
-                # 2. 更新打印状态（新增）
-                # Klipper原生状态 → MQTT协议标准状态映射表
-                KLIPPER_STATE_MAP = {
-                    "standby": PRINT_STATE["IDLE"],
-                    "printing": PRINT_STATE["PRINTING"],
-                    "paused": PRINT_STATE["paused"],
-                    "complete": PRINT_STATE["COMPLETE"],
-                    "cancelled": PRINT_STATE["IDLE"],
-                    "error": PRINT_STATE["ERROR"]
-                }
-                # 提取原生打印状态
-                raw_print_state = print_stats.get("state", "standby")
-                # 映射为协议规定标准状态
-                self.status_cache["print_state"] = KLIPPER_STATE_MAP.get(raw_print_state, PRINT_STATE["IDLE"])
+                temp_root = self.status_cache.get("temperature", {})
+                nozzle_cache = temp_root.get("nozzle", {})
+                bed_cache = temp_root.get("bed", {})
+                temp_out = self.status_cache["temperature"]
 
-                # 额外补充：加热阶段判断（区分idle和heating）
-                heater_nozzle = klipper_state.get("extruder", {})
-                heater_bed = klipper_state.get("heater_bed", {})
-                nozzle_target = heater_nozzle.get("target", 0)
-                bed_target = heater_bed.get("target", 0)
-                current_state = self.status_cache["print_state"]
-                # 空闲但有加热目标 → 协议状态改为heating
-                if current_state == PRINT_STATE["IDLE"] and (nozzle_target > 0 or bed_target > 0):
+                # 喷头增量更新
+                if "extruder" in klipper_state:
+                    extruder_upd = klipper_state["extruder"]
+                    for k, v in extruder_upd.items():
+                        if k in ("current", "target", "power"):
+                            temp_out["nozzle"][k] = v
+                # 热床增量更新
+                if "heater_bed" in klipper_state:
+                    bed_upd = klipper_state["heater_bed"]
+                    for k, v in bed_upd.items():
+                        if k in ("current", "target", "power"):
+                            temp_out["bed"][k] = v
+
+                # 安全读取功率
+                extruder_data = klipper_state.get("extruder", {})
+                bed_data = klipper_state.get("heater_bed", {})
+                extruder_power = extruder_data.get("power", 0.0)
+                bed_power = bed_data.get("power", 0.0)
+                temp_out["nozzle"]["heating"] = extruder_power > 0
+                temp_out["bed"]["heating"] = bed_power > 0
+
+                # 运动轴
+                if "toolhead" in klipper_state:
+                    th = klipper_state["toolhead"]
+                    motion = self.status_cache["motion"]
+                    if "position" in th:
+                        pos = th["position"]
+                        motion["position"]["x"] = pos[0]
+                        motion["position"]["y"] = pos[1]
+                        motion["position"]["z"] = pos[2]
+                        motion["position"]["e"] = pos[3]
+                    if "homed_axes" in th:
+                        ha = th["homed_axes"]
+                        motion["homed"]["x"] = "x" in ha
+                        motion["homed"]["y"] = "y" in ha
+                        motion["homed"]["z"] = "z" in ha
+                    if "velocity" in th:
+                        motion["current_velocity"] = round(th["velocity"],1)
+
+                # 打印状态
+                if "print_stats" in klipper_state:
+                    ps = klipper_state["print_stats"]
+                    prog = self.status_cache["print_progress"]
+                    state_map = {
+                        "standby": PRINT_STATE["IDLE"],
+                        "printing": PRINT_STATE["PRINTING"],
+                        "paused": PRINT_STATE["paused"],
+                        "complete": PRINT_STATE["COMPLETE"],
+                        "cancelled": PRINT_STATE["IDLE"],
+                        "error": PRINT_STATE["ERROR"]
+                    }
+                    if "state" in ps:
+                        self.status_cache["print_state"] = state_map.get(ps["state"], PRINT_STATE["IDLE"])
+                    if "filename" in ps:
+                        prog["current_file"] = ps["filename"]
+                    if "print_duration" in ps:
+                        prog["print_duration"] = round(ps.get("print_duration"),1)
+                    if "progress" in ps:
+                        prog["progress_percent"] = round(ps.get("progress",0)*100,2)
+                    if "filament_used" in ps:
+                        prog["filament_used"] = round(ps.get("filament_used"),2)
+
+                # 加温判断
+                nozzle_target = temp_out["nozzle"].get("target", 0.0)
+                bed_target = temp_out["bed"].get("target", 0.0)
+                curr_st = self.status_cache["print_state"]
+                if curr_st == PRINT_STATE["IDLE"] and (nozzle_target > 0 or bed_target > 0):
                     self.status_cache["print_state"] = PRINT_STATE["HEATING"]
-                
-                # 3. 更新打印进度（新增）
-                self.status_cache["print_progress"] = {
-                    "current_file": print_stats.get("filename", ""),
-                    "print_duration": print_stats.get("print_duration", 0),
-                    "remain_time": print_stats.get("estimated_time", 0) - print_stats.get("print_duration", 0),
-                    "progress_percent": print_stats.get("progress", 0) * 100,
-                    "current_layer": 0,  # 需Klipper启用layer_display插件
-                    "total_layers": 0,
-                    "filament_used_mm": print_stats.get("filament_used", 0)
-                }
         except Exception as e:
-            logger.error(f"状态更新回调异常：{e}")
+            logger.error(f"notify回调异常: {e}", exc_info=True)
 
     def _load_persistent_data(self):
         """加载持久化配置和断点数据"""
@@ -879,9 +834,12 @@ class StatusManager:
                 logger.warning(f"配置文件加载失败：{e}")
 
     def get_full_status(self):
-        """获取全量状态快照"""
+        logger.debug("get_full_status：尝试获取status_lock锁")
         with self.status_lock:
-            return json.loads(json.dumps(self.status_cache))
+            logger.debug("get_full_status：成功拿到锁，复制缓存")
+            snap = json.loads(json.dumps(self.status_cache))
+            logger.debug("get_full_status：缓存复制完成，释放锁")
+            return snap
 
     def set_print_state(self, new_state):
         """切换打印状态，触发状态变更事件"""
@@ -1213,13 +1171,13 @@ class MQTTService:
         return resp
 
     def _on_connect(self, client, userdata, flags, rc):
-        """连接成功回调"""
         if rc == 0:
             self.connected = True
-            self.reconnect_delay = 1  # 重置重连间隔
+            self.reconnect_delay = 1
             logger.info("✅ MQTT双向TLS连接成功")
             
-            # 订阅所有下行指令Topic
+            # 订阅topic分段日志
+            logger.info("开始订阅下行指令Topic...")
             cmd_topics = [
                 (f"device/{DEVICE_ID}/cmd/print", 1),
                 (f"device/{DEVICE_ID}/cmd/param", 1),
@@ -1231,14 +1189,24 @@ class MQTTService:
             ]
             client.subscribe(cmd_topics)
             logger.info("所有下行指令Topic订阅完成")
-            
-            # 1. 发布设备基础信息（保留消息）
+
+            # 发布设备信息日志
+            logger.info("即将执行设备信息发布...")
             self._publish_device_info()
-            # 2. 补发断线缓存的消息
+            logger.info("设备基础信息已发布完成")
+
+            # 补发缓存日志
+            logger.info("开始补发离线缓存消息...")
             self._flush_offline_cache()
-            # 3. 启动定时上报线程
-            self._start_report_thread()
-            
+            logger.info("断线缓存消息已全部补发")
+
+            # 核心卡点：单独捕获上报线程启动异常
+            logger.info("==================== 准备启动定时上报线程 ====================")
+            try:
+                self._start_report_thread()
+                logger.info("==================== 定时上报线程创建成功 ====================")
+            except Exception as thread_err:
+                logger.error("启动上报线程抛出异常！", exc_info=True)
         else:
             logger.error(f"❌ MQTT连接失败，错误码：{rc}")
 
@@ -1605,24 +1573,34 @@ class MQTTService:
         logger.error(f"【错误响应已推送至MQTT】request_id={request_id}, error_code={error_code}, msg={msg}")
 
     def _start_report_thread(self):
-        """启动定时状态上报线程（永久保活，断连不销毁）"""
+        logger.info("进入_start_report_thread函数，准备创建线程")
         def report_loop():
-            logger.info("【状态上报守护线程启动】")
+            logger.info("===== 状态上报守护线程 已成功进入循环 ====")
             loop_cnt = 0
             while True:
                 try:
+                    logger.debug(f"上报循环[{loop_cnt}] 轮次开始，connected={self.connected}")
                     if self.connected:
+                        logger.debug(f"开始读取全量状态缓存")
                         status = self.status_mgr.get_full_status()
+                        logger.debug(f"缓存读取完毕，打印状态：{status['print_state']}")
                         msg = self._build_common_header("status")
                         msg["data"] = status
-                        self.publish(f"device/{DEVICE_ID}/status", msg, qos=1)
-                        # logger.debug(f"【定时上报成功 第{loop_cnt}次】打印状态:{status['print_state']}")
+                        logger.debug(f"开始调用publish上报topic=device/{DEVICE_ID}/status")
+                        pub_topic = f"device/{DEVICE_ID}/status"
+                        logger.debug(f"定时上报发布完整topic：{pub_topic}")
+                        self.publish(pub_topic, msg, qos=1)
+                        logger.info(f"【定时上报成功 第{loop_cnt}次】打印状态:{status['print_state']}")
                         loop_cnt += 1
+                    else:
+                        logger.debug(f"MQTT离线，跳过本次上报")
                 except Exception as e:
                     logger.error(f"【上报单次异常】{e}", exc_info=True)
+                logger.debug(f"本轮结束，休眠{STATUS_REPORT_INTERVAL}秒")
                 time.sleep(STATUS_REPORT_INTERVAL)
-        threading.Thread(target=report_loop, daemon=True, name="status_report").start()
-        logger.info("状态定时上报线程启动")
+        t = threading.Thread(target=report_loop, daemon=True, name="status_report")
+        t.start()
+        logger.info("上报线程Thread已调用start()，后台运行")
 
     def publish_event(self, level, event_type, event_code, event_data):
         """发布事件（触发式，QoS=1）"""
@@ -1630,16 +1608,22 @@ class MQTTService:
         self.publish(f"device/{DEVICE_ID}/event", event_msg, qos=1)
 
     def publish(self, topic, payload, qos=0, retain=False):
-        """统一发布接口，离线时自动缓存"""
         payload_str = json.dumps(payload, ensure_ascii=False)
+        logger.debug(f"publish 准备发送 topic={topic}, qos={qos}, connected={self.connected}")
         if self.connected:
-            self.client.publish(topic, payload_str, qos=qos, retain=retain)
+            try:
+                pub_info = self.client.publish(topic, payload_str, qos=qos, retain=retain)
+                pub_info.wait_for_publish(timeout=2)
+                if pub_info.is_published():
+                    logger.debug(f"publish成功，mid={pub_info.mid}")
+                else:
+                    logger.error(f"publish发送未确认 mid={pub_info.mid}")
+            except Exception as pub_err:
+                logger.error(f"publish发送异常：{pub_err}", exc_info=True)
         else:
-            # 关键消息离线缓存，上线补发
-            if qos >= 1:
-                with self.cache_lock:
-                    self.offline_cache.append((topic, payload_str, qos, retain))
-                logger.debug(f"连接断开，消息已缓存：{topic}")
+            with self.cache_lock:
+                self.offline_cache.append((topic, payload_str, qos, retain))
+            logger.debug(f"离线缓存消息 topic={topic}")
 
     def _flush_offline_cache(self):
         """重连成功后补发缓存的消息"""
@@ -1704,20 +1688,20 @@ if __name__ == "__main__":
     logger.info(f"协议版本：{PROTOCOL_VERSION}")
     logger.info("="*50)
     
-    # 初始化各模块
-    # 1. 先空实例化，不传入stm32
+    # 1. 初始化状态管理器
     status_manager = StatusManager(None, None)
-    # 2. 创建STM32适配器，传入status_manager
+    # 2. 创建适配器，变量名 stm32_adapter
     stm32_adapter = STM32Adapter(status_manager)
-    # 3. 双向绑定对象
+    # 3. 双向绑定，正确变量名 stm32_adapter
     status_manager.stm32 = stm32_adapter
-    # 4. 现在stm32不是None，再绑定回调（关键修复）
-    status_manager.stm32.status_callback = status_manager._on_klipper_status_update
-    # 5. 创建MQTT服务，双向绑定
+    # 4. 赋值回调（必须在创建实例之后）
+    stm32_adapter.status_callback = status_manager._on_klipper_status_update
+
+    # 5. 创建MQTT服务
     mqtt_service = MQTTService(status_manager, stm32_adapter)
     status_manager.mqtt_service = mqtt_service
     
-    # 启动服务
+    # 启动MQTT服务
     mqtt_service.start()
     
     # 主线程保活

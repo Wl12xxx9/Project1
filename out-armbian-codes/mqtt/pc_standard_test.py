@@ -36,7 +36,7 @@ response_map = {}  # request_id -> 响应结果，用于同步等待
 response_cond = threading.Condition() 
 client = None
 # 新增：状态消息异步队列，解耦on_message阻塞
-status_msg_queue = queue.Queue(maxsize=200)
+status_msg_queue = queue.Queue()
 
 HELP_INFO = """
 ===== 指令清单 =====
@@ -100,7 +100,9 @@ def on_connect(client, userdata, flags, rc):
             (f"device/{DEVICE_ID}/event", 1),
             (f"device/{DEVICE_ID}/response", 1)
         ]
-        client.subscribe(topics)
+        # 接收订阅返回码，打印是否订阅成功
+        sub_rc = client.subscribe(topics)
+        logger.info(f"订阅返回结果：{sub_rc}")
         logger.info("所有上行Topic订阅完成，开始监听消息")
     else:
         logger.error(f"❌ 连接失败，错误码：{rc}")
@@ -108,8 +110,16 @@ def on_connect(client, userdata, flags, rc):
 # ========== MQTT回调函数 ==========
 def on_message(client, userdata, msg):
     try:
+        logger.info(f"MQTT收到原始topic=[{msg.topic}]")
         payload = json.loads(msg.payload.decode())
         topic = msg.topic
+        # 所有消息统一塞进状态队列，临时调试
+        # try:
+        #     status_msg_queue.put_nowait(payload)
+        #     logger.info(f"所有消息直接入队，主题：{topic}")
+        # except queue.Full:
+        #     logger.warning("队列满")
+
         # 设备基础信息（保留消息）
         if topic.endswith("/info"):
             logger.info("\n📥 【设备基础信息】收到保留消息")
@@ -120,6 +130,7 @@ def on_message(client, userdata, msg):
             # 直接丢队列，回调立刻退出，不阻塞MQTT网络循环
             try:
                 status_msg_queue.put_nowait(payload)
+                logger.info("status消息成功入队列")
             except queue.Full:
                 logger.warning("状态消息队列已满，丢弃一条状态上报")
         # elif topic.endswith("/status"):
@@ -135,7 +146,7 @@ def on_message(client, userdata, msg):
         #     prog_root = data_root.get("print_progress", {})
         #     progress = prog_root.get("progress_percent", 0.0)
 
-        #     logger.debug(f"📥 【实时状态】状态:{print_state} | 喷嘴:{nozzle_temp}℃ | 进度:{progress}%")
+        #     logger.info(f"📥 【实时状态】状态:{print_state} | 喷嘴:{nozzle_temp}℃ | 进度:{progress}%")
         
         # 事件告警
         elif topic.endswith("/event"):
@@ -165,30 +176,73 @@ def on_message(client, userdata, msg):
     except Exception as e:
         logger.error(f"消息解析异常：{e}, 原始内容：{msg.payload[:200]}")
 
-# 新增：单独线程消费status状态消息，不阻塞MQTT回调
+# 新增：单独线程消费status消息，不阻塞MQTT回调
 def status_consumer_thread():
+    logger.info("【状态消费线程】线程成功启动，开始循环等待消息队列")
+    loop_count = 0
     while True:
         try:
+            logger.info(f"【状态消费线程】第{loop_count}轮，准备阻塞取消息")
             payload = status_msg_queue.get()
+            logger.info(f"【状态消费线程】成功取出一条status消息，队列剩余：{status_msg_queue.qsize()}")
             data_root = payload.get("data", {})
-            print_state = data_root.get("print_state", "unknown")
-            # 温度安全取值
+            # 取出各模块数据，和ws_test_2解析逻辑完全对齐
             temp_root = data_root.get("temperature", {})
-            nozzle_info = temp_root.get("nozzle", {})
-            nozzle_temp = nozzle_info.get("current", 0.0)
-            # 打印进度安全取值
-            prog_root = data_root.get("print_progress", {})
-            progress = prog_root.get("progress_percent", 0.0)
-            # logger.info(f"📥 【实时状态】状态:{print_state} | 喷嘴:{nozzle_temp}℃ | 进度:{progress}%")
-            # logger.info(f"\n📥 【实时状态】队列剩余:{status_msg_queue.qsize()} | 状态:{print_state} | 喷嘴:{nozzle_temp}℃ | 进度:{progress}%")
-            light_info = data_root.get("light", {})
-            ai_info = data_root.get("ai_camera", {})
-            # logger.info(f"【实时状态】队列剩余:{status_msg_queue.qsize()} | 打印:{print_state} | 喷嘴:{nozzle_temp}℃ | 进度:{progress}% "
-            # f"灯光开关:{light_info.get('switch')} AI硬件:{ai_info.get('hardware_switch')}")
+            nozzle = temp_root.get("nozzle", {})
+            bed_temp_info = temp_root.get("bed", {})
+            motion = data_root.get("motion", {})
+            fan_data = data_root.get("fan", {})
+            prog = data_root.get("print_progress", {})
+            logger.info("【状态消费线程】完成所有字段解析，准备打印格式化状态")
+            # 喷头解析
+            nozzle_current = nozzle.get("current", 0.0) or 0.0
+            nozzle_target = nozzle.get("target", 0.0) or 0.0
+            nozzle_power = nozzle.get("heating", False)
+            power_percent = 100 if nozzle_power else 0
+            # 热床解析
+            bed_current = bed_temp_info.get("current")
+            bed_target = bed_temp_info.get("target")
+            bed_power_flag = bed_temp_info.get("heating", False)
+            bed_power_pct = 100 if bed_power_flag else 0
+            # 风扇
+            fan_speed = fan_data.get("part_cooling_speed", 0.0) / 100
+            # 运动轴
+            pos = motion.get("position", {})
+            x = pos.get("x", 0.0)
+            y = pos.get("y", 0.0)
+            z = pos.get("z", 0.0)
+            e = pos.get("e", 0.0)
+            vel = motion.get("current_velocity", 0.0) or 0.0
+            homed_dict = motion.get("homed", {})
+            homed_x = homed_dict.get("x", False)
+            homed_y = homed_dict.get("y", False)
+            homed_z = homed_dict.get("z", False)
+            # 打印信息
+            print_state = data_root.get("print_state", "standby")
+            file_name = prog.get("current_file", "")
+            print_dur = prog.get("print_duration", 0.0) or 0.0
+            progress = prog.get("progress_percent", 0.0) or 0.0
+            filament = prog.get("filament_used_mm", 0.0) or 0.0
+            # 严格对齐ws_test_2打印格式
+            print("\n===== 解析后的打印机实时状态 =====")
+            print(f"【喷头】当前温度：{nozzle_current} ℃ | 目标温度：{nozzle_target} ℃ | 加热功率：{power_percent:.1f}%")
+            if bed_current is None:
+                print(f"【热床】当前温度：未配置 | 目标温度：未配置 | 加热功率：{bed_power_pct:.1f}%")
+            else:
+                print(f"【热床】当前温度：{bed_current} ℃ | 目标温度：{bed_target} ℃ | 加热功率：{bed_power_pct:.1f}%")
+            print(f"【冷却风扇】转速：{fan_speed*100:.1f}%")
+            print(f"【运动轴坐标】X={x:.2f} Y={y:.2f} Z={z:.2f} E={e:.2f}")
+            print(f"【轴归位状态】X:{homed_x} Y:{homed_y} Z:{homed_z} | 当前速度：{vel:.2f} mm/s")
+            print(f"【打印状态】运行状态：{print_state} | 当前文件：{file_name}")
+            print(f"【打印进度】已打印时长：{print_dur:.1f}s | 进度：{progress}% | 耗材消耗：{filament:.2f}mm")
+            print("="*40)
+            logger.info(f"【状态消费线程】第{loop_count}条状态打印完成")
+            loop_count += 1
         except Exception as e:
-            logger.error(f"状态消息消费异常：{e}")
+            logger.error(f"【状态消费线程】消息消费异常：{e}", exc_info=True)
         finally:
             status_msg_queue.task_done()
+            logger.info(f"【状态消费线程】task_done执行完毕，释放队列标记")
 
 # ========== 同步指令发送（等待响应） ==========
 def send_cmd_wait(topic_suffix, cmd_type, data):
@@ -429,8 +483,60 @@ def console_mode():
                 logger.info("👋 程序退出")
                 exit(0)
             elif cmd == "1":
+                # ok, resp = PrinterCommands.query_full_status()
+                # print(json.dumps(resp, indent=2, ensure_ascii=False) if ok else "超时")
                 ok, resp = PrinterCommands.query_full_status()
-                print(json.dumps(resp, indent=2, ensure_ascii=False) if ok else "超时")
+                if ok:
+                    full_data = resp["data"]
+                    # 复用上面同一套解析逻辑打印，和ws对齐
+                    temp_root = full_data.get("temperature", {})
+                    nozzle = temp_root.get("nozzle", {})
+                    bed_temp_info = temp_root.get("bed", {})
+                    motion = full_data.get("motion", {})
+                    fan_data = full_data.get("fan", {})
+                    prog = full_data.get("print_progress", {})
+
+                    nozzle_current = nozzle.get("current", 0.0) or 0.0
+                    nozzle_target = nozzle.get("target", 0.0) or 0.0
+                    nozzle_power = nozzle.get("heating", False)
+                    power_percent = 100 if nozzle_power else 0
+
+                    bed_current = bed_temp_info.get("current")
+                    bed_target = bed_temp_info.get("target")
+                    bed_power_flag = bed_temp_info.get("heating", False)
+                    bed_power_pct = 100 if bed_power_flag else 0
+
+                    fan_speed = fan_data.get("part_cooling_speed", 0.0) / 100
+                    pos = motion.get("position", {})
+                    x = pos.get("x", 0.0)
+                    y = pos.get("y", 0.0)
+                    z = pos.get("z", 0.0)
+                    e = pos.get("e", 0.0)
+                    vel = motion.get("current_velocity", 0.0) or 0.0
+                    homed_dict = motion.get("homed", {})
+                    homed_x = homed_dict.get("x", False)
+                    homed_y = homed_dict.get("y", False)
+                    homed_z = homed_dict.get("z", False)
+
+                    print_state = full_data.get("print_state", "standby")
+                    file_name = prog.get("current_file", "")
+                    print_dur = prog.get("print_duration", 0.0) or 0.0
+                    progress = prog.get("progress_percent", 0.0) or 0.0
+                    filament = prog.get("filament_used_mm", 0.0) or 0.0
+
+                    print("\n===== 解析后的打印机实时状态 =====")
+                    print(f"【喷头】当前温度：{nozzle_current} ℃ | 目标温度：{nozzle_target} ℃ | 加热功率：{power_percent:.1f}%")
+                    if bed_current is None:
+                        print(f"【热床】当前温度：未配置 | 目标温度：未配置 | 加热功率：{bed_power_pct:.1f}%")
+                    else:
+                        print(f"【热床】当前温度：{bed_current} ℃ | 目标温度：{bed_target} ℃ | 加热功率：{bed_power_pct:.1f}%")
+                    print(f"【冷却风扇】转速：{fan_speed*100:.1f}%")
+                    print(f"【运动轴坐标】X={x:.2f} Y={y:.2f} Z={z:.2f} E={e:.2f}")
+                    print(f"【轴归位状态】X:{homed_x} Y:{homed_y} Z:{homed_z} | 当前速度：{vel:.2f} mm/s")
+                    print(f"【打印状态】运行状态：{print_state} | 当前文件：{file_name}")
+                    print(f"【打印进度】已打印时长：{print_dur:.1f}s | 进度：{progress}% | 耗材消耗：{filament_used:.2f}mm")
+                else:
+                    print("查询超时")
             elif cmd == "2":
                 t = float(input("输入喷嘴目标温度："))
                 ok, resp = PrinterCommands.set_temp(nozzle=t)
@@ -509,7 +615,7 @@ def console_mode():
 if __name__ == "__main__":
     # client = mqtt.Client(client_id="pc_test_admin_001", callback_api_version=mqtt.CallbackAPIVersion.VERSION1)
     # 第二个参数clean_session=False
-    client = mqtt.Client(client_id="pc_test_admin_001", callback_api_version=mqtt.CallbackAPIVersion.VERSION1, clean_session=False)
+    client = mqtt.Client(client_id="pc_test_admin_001", callback_api_version=mqtt.CallbackAPIVersion.VERSION1, clean_session=True)
     client.username_pw_set(MQTT_USER, MQTT_PWD)
 
     # 双向TLS配置
